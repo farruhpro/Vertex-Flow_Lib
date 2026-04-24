@@ -57,8 +57,22 @@ fn VertexFlow_ExtractJsonValue str key = (
     return dnStr.Substring pStart (pEnd - pStart)
 )
 
--- === OMNI-DIRECTIONAL RELINKER ===
-fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
+-- [ИЗМЕНЕНИЕ 1.1] Функция глобального сбора всех ассетов из памяти 3ds Max
+-- Она ищет текстуры, прокси и IES-ки с флагом processAllAnimatables:true (самый надежный метод)
+fn VertexFlow_GatherAllAssets = (
+    local assets = #()
+    local categories = #(textureMap.classes, GeometryClass.classes, light.classes)
+    for cat in categories do (
+        for cls in cat do (
+            join assets (getClassInstances cls processAllAnimatables:true)
+        )
+    )
+    return makeUniqueArray assets
+)
+
+-- [ИЗМЕНЕНИЕ 1.2] Новый релинкер, который работает на основе разницы (Diff)
+-- Он принимает ассеты ДО импорта и ПОСЛЕ импорта, вычисляет новые и релинкует только их.
+fn VertexFlow_RelinkNewAssets texPath preAssets postAssets = (
     if texPath == undefined or texPath == "" do return false
     
     local normTexPath = substituteString texPath "/" "\\"
@@ -71,45 +85,37 @@ fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
         return false
     )
     
+    -- Вычисляем только НОВЫЕ текстуры (которых не было в сцене до импорта)
+    local newAssets = #()
+    for a in postAssets do (
+        if findItem preAssets a == 0 do append newAssets a
+    )
+    
+    if newAssets.count == 0 do (
+        VertexFlow_LogMsg "No new textures needed relinking."
+        return false
+    )
+    
     local relinkedCount = 0
     local propsToCheck = #("filename", "HDRIMapName", "mapName", "ies_file", "iesFile", "file", "proxy_file")
-    local categories = #(textureMap.classes, GeometryClass.classes, light.classes)
     
-    for cat in categories do (
-        for cls in cat do (
-            try (
-                local instances = #()
-                
-                -- [ИЗМЕНЕНИЕ 1] Убрали флаг processAllAnimatables:true для targetNodes
-                -- Почему прошлый код не работал: processAllAnimatables принудительно заставлял 3ds Max игнорировать target: и сканировать всю сцену.
-                -- Как работает новый код: Если передана импортированная модель, мы используем только target, запирая релинкер строго внутри нее.
-                if targetNodes != unsupplied and targetNodes != undefined then (
-                    if targetNodes.count > 0 do (
-                        instances = getClassInstances cls target:targetNodes
-                    )
-                ) else (
-                    instances = getClassInstances cls processAllAnimatables:true
-                )
-                
-                for inst in instances do (
-                    for p in propsToCheck do (
-                        if hasProperty inst p do (
-                            local oldPath = getProperty inst p
-                            if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
-                                local fName = filenameFromPath oldPath
-                                local newPath = normTexPath + "\\" + fName
-                                
-                                if (toLower oldPath) != (toLower newPath) do (
-                                    if doesFileExist newPath then (
-                                        setProperty inst p newPath
-                                        relinkedCount += 1
-                                    )
-                                )
-                            )
+    -- Меняем пути ТОЛЬКО у новых текстур
+    for inst in newAssets do (
+        for p in propsToCheck do (
+            if hasProperty inst p do (
+                local oldPath = getProperty inst p
+                if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
+                    local fName = filenameFromPath oldPath
+                    local newPath = normTexPath + "\\" + fName
+                    
+                    if (toLower oldPath) != (toLower newPath) do (
+                        if doesFileExist newPath then (
+                            setProperty inst p newPath
+                            relinkedCount += 1
                         )
                     )
                 )
-            ) catch()
+            )
         )
     )
     
@@ -117,9 +123,9 @@ fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
     try(ATSOps.Refresh())catch()
     
     if relinkedCount > 0 then (
-        VertexFlow_LogMsg ("Relinked " + (relinkedCount as string) + " assets for imported model.")
+        VertexFlow_LogMsg ("Relinked " + (relinkedCount as string) + " paths for new model.")
     ) else (
-        VertexFlow_LogMsg ("No textures needed relinking.")
+        VertexFlow_LogMsg "New textures found, but paths were already correct or files missing."
     )
 )
 
@@ -161,31 +167,36 @@ fn VertexFlow_ProcessTask sender args = (
                             clearSelection()
                             local preImportObjects = objects as array
                             
+                            -- [ИЗМЕНЕНИЕ 1.3] Делаем слепок всех текстур сцены ДО импорта
+                            local preAssets = VertexFlow_GatherAllAssets()
+                            
                             if ext == ".max" then (
                                 local mergeResult = mergeMAXFile mPath #mergeDups #select quiet:true
                                 
                                 if mergeResult == true then (
                                     importSuccess = true
                                 ) else (
-                                    -- [ИЗМЕНЕНИЕ 2] Нативный, прямой вызов getMaxFileVersion
-                                    -- Почему прошлый код не работал: execute() крашился из-за экранирования путей со слэшами.
-                                    -- Как работает новый код: Мы используем встроенную функцию напрямую. Она возвращает массив.
-                                    -- Мы проверяем массив и вычисляем реальный год выпуска программы: (Internal Version / 1000) + 1998.
+                                    -- [ИЗМЕНЕНИЕ 2.1] Подготавливаем путь строго с бэк-слэшами (\) для getMaxFileVersion
+                                    local safeWinPath = substituteString mPath "/" "\\"
                                     local fileVerInfo = undefined
-                                    try ( fileVerInfo = getMaxFileVersion mPath ) catch()
+                                    try ( fileVerInfo = getMaxFileVersion safeWinPath ) catch()
                                     
+                                    -- [ИЗМЕНЕНИЕ 2.2] Железобетонная обработка версии
                                     if fileVerInfo != undefined and classOf fileVerInfo == Array and fileVerInfo.count > 0 then (
                                         local curVerInfo = maxVersion()
-                                        local curYear = (curVerInfo[1] / 1000) + 1998
-                                        local fileYear = (fileVerInfo[1] / 1000) + 1998
+                                        local curV = curVerInfo[1] / 1000
+                                        local fileV = fileVerInfo[1] / 1000
                                         
-                                        if fileVerInfo[1] > curVerInfo[1] then (
+                                        local curYear = curV + 1998
+                                        local fileYear = fileV + 1998
+                                        
+                                        if fileV > curV then (
                                             VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + (fileYear as string) + ". You use " + (curYear as string) + ".") isError:true
                                         ) else (
                                             VertexFlow_LogMsg "Import Error: Failed to merge .max file (Corrupted or unsupported)." isError:true
                                         )
                                     ) else (
-                                        VertexFlow_LogMsg "Import Error: Failed to merge .max file." isError:true
+                                        VertexFlow_LogMsg "Import Error: Failed to merge .max file (Cannot read version)." isError:true
                                     )
                                 )
                             ) else if ext == ".fbx" or ext == ".obj" then (
@@ -201,10 +212,8 @@ fn VertexFlow_ProcessTask sender args = (
                             )
                             
                             if importSuccess then (
-                                -- Берем только что импортированные объекты (они выделены автоматически)
+                                -- Выделение новых объектов (для фокусировки камеры)
                                 local importedNodes = getCurrentSelection() as array
-                                
-                                -- Запасной вариант для сторонних форматов
                                 if importedNodes.count == 0 then (
                                     local newNodes = #()
                                     for obj in objects do (
@@ -216,9 +225,10 @@ fn VertexFlow_ProcessTask sender args = (
                                     )
                                 )
                                 
-                                -- Передаем в релинкер только выделенные (новые) объекты
-                                if tPath != "" and importedNodes.count > 0 do (
-                                    VertexFlow_RelinkAssets tPath targetNodes:importedNodes
+                                -- [ИЗМЕНЕНИЕ 1.4] Делаем слепок ПОСЛЕ импорта и запускаем релинкер
+                                if tPath != "" do (
+                                    local postAssets = VertexFlow_GatherAllAssets()
+                                    VertexFlow_RelinkNewAssets tPath preAssets postAssets
                                 )
                                 
                                 if importedNodes.count > 0 do max zoomext sel
