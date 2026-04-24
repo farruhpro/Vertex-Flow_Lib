@@ -134,15 +134,22 @@ classes = (VIEW3D_PT_vertex_flow, VF_OT_clear_logs)
 
 def register():
     for cls in classes:
-        bpy.utils.register_class(cls)
+        # Защита от двойной регистрации (чтобы Blender не ругался)
+        if not hasattr(bpy.types, cls.__name__):
+            bpy.utils.register_class(cls)
     if not bpy.app.timers.is_registered(vertex_flow_listener):
         bpy.app.timers.register(vertex_flow_listener)
 
 def unregister():
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        if hasattr(bpy.types, cls.__name__):
+            bpy.utils.unregister_class(cls)
     if bpy.app.timers.is_registered(vertex_flow_listener):
         bpy.app.timers.unregister(vertex_flow_listener)
 
+# Стандартный запуск
 if __name__ == "__main__":
+    register()
+# АВТОЗАПУСК ДЛЯ ПАПКИ STARTUP:
+elif "startup" in os.path.basename(os.path.dirname(__file__)).lower():
     register()
