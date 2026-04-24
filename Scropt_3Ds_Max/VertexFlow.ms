@@ -10,41 +10,18 @@
         try (
             deleteFile targetFile
             copyFile sourceFile targetFile
-            messageBox "Vertex Flow Plug-in installed successfully!\n\nIt will start automatically in the background." title:"Vertex Flow: Installation"
+            messageBox "Vertex Flow Plug-in installed successfully!\n\nIt will start automatically in the background.\nTo open the console, press 'X' and search for 'Vertex Flow Console'." title:"Vertex Flow: Installation"
         ) catch (
             messageBox "Installation failed. Please run 3ds Max as Administrator." title:"Vertex Flow: Error"
         )
     )
 )
 
--- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 global VertexFlow_Log = #()
 global VertexFlow_UpdateUI
 global VertexFlow_Timer
 global VertexFlowListenerUI 
 
--- ГЛОБАЛЬНАЯ РЕКУРСИВНАЯ ФУНКЦИЯ (Вне всех scope)
-fn VertexFlow_CollectMatsAndMaps m arr = (
-    if m == undefined do return false
-    if findItem arr m > 0 do return false
-    append arr m
-    
-    try (
-        if hasProperty m "getNumSubMtls" do (
-            local numMtls = getNumSubMtls m
-            for i = 1 to numMtls do VertexFlow_CollectMatsAndMaps (getSubMtl m i) arr
-        )
-    ) catch()
-    
-    try (
-        if hasProperty m "getNumSubTexmaps" do (
-            local numMaps = getNumSubTexmaps m
-            for i = 1 to numMaps do VertexFlow_CollectMatsAndMaps (getSubTexmap m i) arr
-        )
-    ) catch()
-)
-
--- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 fn VertexFlow_PadZero num = (
     local s = num as string
     if s.count < 2 then "0" + s else s
@@ -80,8 +57,9 @@ fn VertexFlow_ExtractJsonValue str key = (
     return dnStr.Substring pStart (pEnd - pStart)
 )
 
-fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
-    if texPath == undefined or texPath == "" or targetNodes == undefined or targetNodes.count == 0 do return false
+-- === РЕЛИНКЕР ТОЛЬКО ДЛЯ ИМПОРТИРОВАННОЙ МОДЕЛИ ===
+fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
+    if texPath == undefined or texPath == "" do return false
     
     local normTexPath = substituteString texPath "/" "\\"
     if substring normTexPath normTexPath.count 1 == "\\" do (
@@ -90,30 +68,48 @@ fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
     
     local relinkedCount = 0
     local propsToCheck = #("filename", "HDRIMapName", "mapName", "ies_file", "iesFile", "file", "proxy_file")
-    local allMatsAndMaps = #()
+    local categories = #(textureMap.classes, GeometryClass.classes, light.classes)
     
-    for obj in targetNodes do (
-        if hasProperty obj "material" and obj.material != undefined do VertexFlow_CollectMatsAndMaps obj.material allMatsAndMaps
-        appendIfUnique allMatsAndMaps obj
+    -- Собираем в массив саму геометрию и её материалы
+    local searchTargets = #()
+    if targetNodes != unsupplied and targetNodes != undefined then (
+        for obj in targetNodes do (
+            appendIfUnique searchTargets obj
+            if hasProperty obj "material" and obj.material != undefined do (
+                appendIfUnique searchTargets obj.material
+            )
+        )
     )
     
-    for item in allMatsAndMaps do (
-        for p in propsToCheck do (
-            if hasProperty item p do (
-                try (
-                    local oldPath = getProperty item p
-                    if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
-                        local fName = filenameFromPath oldPath
-                        if fName != "" do (
-                            local newPath = normTexPath + "\\" + fName
-                            if (toLower oldPath) != (toLower newPath) do (
-                                setProperty item p newPath
-                                relinkedCount += 1
+    for cat in categories do (
+        for cls in cat do (
+            try (
+                local instances = #()
+                -- Ищем текстуры строго внутри собранных материалов новой модели
+                if searchTargets.count > 0 then (
+                    instances = getClassInstances cls target:searchTargets
+                ) else (
+                    instances = getClassInstances cls processAllAnimatables:true
+                )
+                
+                for inst in instances do (
+                    for p in propsToCheck do (
+                        if hasProperty inst p do (
+                            local oldPath = getProperty inst p
+                            if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
+                                local fName = filenameFromPath oldPath
+                                local newPath = normTexPath + "\\" + fName
+                                
+                                if (toLower oldPath) != (toLower newPath) do (
+                                    -- Жесткая перезапись пути без проверки на наличие файла
+                                    setProperty inst p newPath
+                                    relinkedCount += 1
+                                )
                             )
                         )
                     )
-                ) catch()
-            )
+                )
+            ) catch()
         )
     )
     
@@ -123,7 +119,7 @@ fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
     if relinkedCount > 0 then (
         VertexFlow_LogMsg ("Relinked " + (relinkedCount as string) + " paths for imported model.")
     ) else (
-        VertexFlow_LogMsg ("No matching textures found for relinking.")
+        VertexFlow_LogMsg ("No textures found for relinking in the imported model.")
     )
 )
 
@@ -146,11 +142,14 @@ fn VertexFlow_ProcessTask sender args = (
             
             if mPath != "" and pPath != "" then (
                 local currentMaxPath = maxFilePath + maxFileName
+                
                 if currentMaxPath == "" then (
                     VertexFlow_LogMsg "Scene is not saved!" isError:true
                     try(deleteFile taskFile)catch()
                 ) else if (VertexFlow_NormalizePath currentMaxPath) == (VertexFlow_NormalizePath pPath) then (
+                    
                     try(deleteFile taskFile)catch()
+                    
                     local fileNameFull = filenameFromPath mPath
                     VertexFlow_LogMsg ("Importing: " + fileNameFull)
                     
@@ -158,66 +157,61 @@ fn VertexFlow_ProcessTask sender args = (
                         try (
                             local ext = toLower (getFilenameType mPath)
                             local importSuccess = false
+                            
+                            -- Запоминаем сцену до импорта
                             clearSelection()
                             local preImportObjects = objects as array
                             
                             if ext == ".max" then (
                                 local mergeResult = mergeMAXFile mPath #mergeDups #select quiet:true
+                                
                                 if mergeResult == true then (
                                     importSuccess = true
                                 ) else (
-                                    local detectedYear = ""
-                                    local fileVerInfo = undefined
-                                    try ( fileVerInfo = getMaxFileVersion mPath ) catch()
-                                    if fileVerInfo != undefined and classOf fileVerInfo == Array and fileVerInfo.count > 0 then (
-                                        detectedYear = ((fileVerInfo[1] / 1000) + 1998) as string
-                                    ) else (
-                                        try (
-                                            local fs = (dotNetClass "System.IO.File").OpenRead mPath
-                                            local br = dotNetObject "System.IO.BinaryReader" fs
-                                            local len = fs.Length
-                                            local firstChunkSize = if len < 100000 then len else 100000
-                                            local firstBytes = br.ReadBytes firstChunkSize
-                                            local lastBytes = #()
-                                            if len > 100000 do (
-                                                fs.Seek -100000 (dotNetClass "System.IO.SeekOrigin").End
-                                                lastBytes = br.ReadBytes 100000
-                                            )
-                                            br.Close(); fs.Close()
-                                            local headerStr = ""
-                                            for b in firstBytes do ( if b >= 32 and b <= 126 do headerStr += bit.intAsChar b )
-                                            for b in lastBytes do ( if b >= 32 and b <= 126 do headerStr += bit.intAsChar b )
-                                            local idx = findString headerStr "3ds Max "
-                                            if idx != undefined then ( detectedYear = substring headerStr (idx + 8) 4 ) else ( detectedYear = "Unknown Newer" )
-                                        ) catch ( detectedYear = "Unknown Newer" )
-                                    )
-                                    local curYear = ((maxVersion())[1] / 1000) + 1998
-                                    VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + detectedYear + ". You use " + (curYear as string) + ".") isError:true
+                                    -- === НАТИВНЫЙ ОБРАБОТЧИК ВЕРСИИ ===
+                                    local fileYear = "Newer Version"
+                                    try (
+                                        local fileVer = getMaxFileVersion mPath
+                                        if fileVer != undefined and classOf fileVer == Array and fileVer.count > 0 do (
+                                            fileYear = ((fileVer[1] / 1000) + 1998) as string
+                                        )
+                                    ) catch()
+                                    
+                                    local curYear = (((maxVersion())[1] / 1000) + 1998) as string
+                                    VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + fileYear + ". You use " + curYear + ".") isError:true
                                 )
                             ) else if ext == ".fbx" or ext == ".obj" then (
-                                local importResult = importFile mPath #noPrompt
-                                if importResult == true then importSuccess = true else VertexFlow_LogMsg ("Format Error: Failed to import " + ext) isError:true
+                                local impResult = importFile mPath #noPrompt
+                                if impResult == true do importSuccess = true
                             ) else (
                                 VertexFlow_LogMsg ("Format " + ext + " not supported!") isError:true
                                 return false
                             )
                             
                             if importSuccess then (
-                                local importedNodes = getCurrentSelection() as array
-                                if importedNodes.count == 0 then (
-                                    local newNodes = #()
-                                    for obj in objects do ( if findItem preImportObjects obj == 0 do append newNodes obj )
-                                    if newNodes.count > 0 do ( select newNodes; importedNodes = newNodes )
+                                -- Собираем только что импортированные объекты
+                                local importedNodes = #()
+                                for obj in objects do (
+                                    if findItem preImportObjects obj == 0 do append importedNodes obj
                                 )
-                                if tPath != "" and importedNodes.count > 0 do VertexFlow_RelinkTargetedNodes tPath importedNodes
-                                if importedNodes.count > 0 do max zoomext sel
+                                -- Резервный вариант, если новые объекты слились с существующими
+                                if importedNodes.count == 0 do importedNodes = getCurrentSelection() as array
+                                
+                                if importedNodes.count > 0 do (
+                                    select importedNodes
+                                    -- Передаем объекты в релинкер
+                                    if tPath != "" do VertexFlow_RelinkAssets tPath targetNodes:importedNodes
+                                    max zoomext sel
+                                )
                                 VertexFlow_LogMsg "Success! Model added." isError:false
                             )
                         ) catch (
                             local err = getCurrentException()
                             VertexFlow_LogMsg ("CRASH: " + err) isError:true
                         )
-                    ) else ( VertexFlow_LogMsg "File not found on disk!" isError:true )
+                    ) else (
+                        VertexFlow_LogMsg "File not found on disk!" isError:true
+                    )
                 )
             ) else (
                 try(deleteFile taskFile)catch()
@@ -227,7 +221,6 @@ fn VertexFlow_ProcessTask sender args = (
     )
 )
 
--- UI ROLLOUT
 try(destroyDialog VertexFlowListenerUI)catch()
 rollout VertexFlowListenerUI "Vertex Flow: Console" width:350 height:320
 (
@@ -255,15 +248,22 @@ rollout VertexFlowListenerUI "Vertex Flow: Console" width:350 height:320
     
     on VertexFlowListenerUI open do ( VertexFlow_UpdateUI = UpdateUI; UpdateUI() )
     on VertexFlowListenerUI close do ( VertexFlow_UpdateUI = undefined )
+    
     on btnToggle pressed do (
         if VertexFlow_Timer != undefined do (
-            if VertexFlow_Timer.Enabled then ( VertexFlow_Timer.Stop(); VertexFlow_LogMsg "Listening stopped." isError:true )
-            else ( VertexFlow_Timer.Start(); VertexFlow_LogMsg "Listening started." isError:false )
+            if VertexFlow_Timer.Enabled then (
+                VertexFlow_Timer.Stop()
+                VertexFlow_LogMsg "Listening stopped." isError:true
+            ) else (
+                VertexFlow_Timer.Start()
+                VertexFlow_LogMsg "Listening started." isError:false
+            )
         )
     )
     on btnManual pressed do ( VertexFlow_ProcessTask undefined undefined )
 )
 
+global VertexFlow_OpenUI
 fn VertexFlow_OpenUI = (
     try(destroyDialog VertexFlowListenerUI)catch()
     createDialog VertexFlowListenerUI style:#(#style_toolwindow, #style_sysmenu)
@@ -277,6 +277,12 @@ if VertexFlow_Timer == undefined do (
     VertexFlow_LogMsg "Background listener started." isError:false
 )
 
-macroScript VertexFlow_UI category:"Vertex Flow" buttonText:"Vertex Flow Console" (
-    on execute do ( VertexFlow_OpenUI() )
+macroScript VertexFlow_UI
+category:"Vertex Flow"
+buttonText:"Vertex Flow Console"
+toolTip:"Open Vertex Flow Console"
+(
+    on execute do (
+        if VertexFlow_OpenUI != undefined do VertexFlow_OpenUI()
+    )
 )
