@@ -57,11 +57,10 @@ fn VertexFlow_ExtractJsonValue str key = (
     return dnStr.Substring pStart (pEnd - pStart)
 )
 
--- === OMNI-DIRECTIONAL RELINKER (???????? ?????? ?????) ===
-fn VertexFlow_RelinkAssets texPath = (
+-- === OMNI-DIRECTIONAL RELINKER ===
+fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
     if texPath == undefined or texPath == "" do return false
     
-    -- ??????????? ???? ??? Windows (???????? / ?? \)
     local normTexPath = substituteString texPath "/" "\\"
     if substring normTexPath normTexPath.count 1 == "\\" do (
         normTexPath = substring normTexPath 1 (normTexPath.count - 1)
@@ -73,26 +72,30 @@ fn VertexFlow_RelinkAssets texPath = (
     )
     
     local relinkedCount = 0
-    -- ?????? ???? ????????? ???????, ??? ??????? ?????? ???? ? ??????
     local propsToCheck = #("filename", "HDRIMapName", "mapName", "ies_file", "iesFile", "file", "proxy_file")
-    
-    -- ??????????? ???????? ??? ?????? ???????, ????????? (Proxy) ? ????? (IES)
     local categories = #(textureMap.classes, GeometryClass.classes, light.classes)
     
     for cat in categories do (
         for cls in cat do (
             try (
-                -- processAllAnimatables:true ?????????? ???? ?????? ???? ? ??????? ??????????
-                for inst in (getClassInstances cls processAllAnimatables:true) do (
+                local instances = #()
+                -- [ИЗМЕНЕНИЕ 1.2] Если массив targetNodes передан, ищем текстуры ТОЛЬКО внутри него. Иначе ищем везде.
+                if targetNodes != unsupplied and targetNodes != undefined then (
+                    if targetNodes.count > 0 then (
+                        instances = getClassInstances cls target:targetNodes processAllAnimatables:true
+                    )
+                ) else (
+                    instances = getClassInstances cls processAllAnimatables:true
+                )
+                
+                for inst in instances do (
                     for p in propsToCheck do (
                         if hasProperty inst p do (
                             local oldPath = getProperty inst p
                             if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
-                                
                                 local fName = filenameFromPath oldPath
                                 local newPath = normTexPath + "\\" + fName
                                 
-                                -- ???? ???? ??? ?? ???????? ? ???? ??????? ?????????? ?? ?????
                                 if (toLower oldPath) != (toLower newPath) do (
                                     if doesFileExist newPath then (
                                         setProperty inst p newPath
@@ -107,7 +110,6 @@ fn VertexFlow_RelinkAssets texPath = (
         )
     )
     
-    -- ????????????? ????????? ??????? ? ??? ??????????
     try(freeSceneBitmaps())catch()
     try(ATSOps.Refresh())catch()
     
@@ -133,7 +135,7 @@ fn VertexFlow_ProcessTask sender args = (
         if fileContent != "" do (
             local mPath = VertexFlow_ExtractJsonValue fileContent "model_path"
             local pPath = VertexFlow_ExtractJsonValue fileContent "project_path"
-            local tPath = VertexFlow_ExtractJsonValue fileContent "textures_path" -- ???????? ???? ? ?????????
+            local tPath = VertexFlow_ExtractJsonValue fileContent "textures_path"
             
             if mPath != "" and pPath != "" then (
                 local currentMaxPath = maxFilePath + maxFileName
@@ -152,21 +154,58 @@ fn VertexFlow_ProcessTask sender args = (
                         try (
                             local ext = toLower (getFilenameType mPath)
                             local importSuccess = false
-                            
+
+                            -- [ИЗМЕНЕНИЕ 1.3] Делаем снимок всех объектов сцены ДО импорта модели.
+                            local preImportObjects = objects as array
+
                             if ext == ".max" then (
-                                mergeMAXFile mPath #mergeDups #select quiet:true
-                                importSuccess = true
+                                -- [ИЗМЕНЕНИЕ 2.1] Читаем результат работы функции, а не слепо доверяем процессу.
+                                local mergeResult = mergeMAXFile mPath #mergeDups #select quiet:true
+                                
+                                if mergeResult == true then (
+                                    importSuccess = true
+                                ) else (
+                                    -- [ИЗМЕНЕНИЕ 2.2] Если импорт сорвался — читаем версию из заголовка файла
+                                    local fileVer = getMaxFileVersion mPath
+                                    local curVer = maxVersion()
+                                    
+                                    if fileVer[1] > curVer[1] then (
+                                        -- Формула вычисления года из версии (например 26000 -> 26+1998 = 2024 год)
+                                        local fileYear = (fileVer[1] / 1000) + 1998
+                                        local curYear = (curVer[1] / 1000) + 1998
+                                        VertexFlow_LogMsg ("Import Error: Model is from 3ds Max " + (fileYear as string) + ". You are using " + (curYear as string) + ".") isError:true
+                                    ) else (
+                                        VertexFlow_LogMsg "Import Error: Failed to merge .max file." isError:true
+                                    )
+                                    importSuccess = false
+                                )
                             ) else if ext == ".fbx" or ext == ".obj" then (
-                                importFile mPath #noPrompt
-                                importSuccess = true
+                                -- Аналогичная проверка для сторонних форматов (защита от битых FBX)
+                                local importResult = importFile mPath #noPrompt
+                                if importResult == true then (
+                                    importSuccess = true
+                                ) else (
+                                    VertexFlow_LogMsg ("Import Error: Failed to import " + ext + " file.") isError:true
+                                    importSuccess = false
+                                )
                             ) else (
                                 VertexFlow_LogMsg ("Format " + ext + " not supported!") isError:true
                                 return false
                             )
                             
                             if importSuccess then (
-                                -- === ????? ???????????? ????? ????? ??????? ===
-                                if tPath != "" do VertexFlow_RelinkAssets tPath
+                                -- [ИЗМЕНЕНИЕ 1.4] Ищем разницу (до/после) и помещаем новые объекты в массив.
+                                local importedNodes = #()
+                                for obj in objects do (
+                                    if findItem preImportObjects obj == 0 do append importedNodes obj
+                                )
+                                
+                                -- Очищаем выделение и выделяем только то, что импортировалось (чтобы zoomext сработал корректно на них)
+                                clearSelection()
+                                if importedNodes.count > 0 do select importedNodes
+                                
+                                -- [ИЗМЕНЕНИЕ 1.5] Передаем в релинкер только новые (исключительно новые!) объекты
+                                if tPath != "" do VertexFlow_RelinkAssets tPath targetNodes:importedNodes
                                 
                                 max zoomext sel
                                 VertexFlow_LogMsg "Success! Model added." isError:false
