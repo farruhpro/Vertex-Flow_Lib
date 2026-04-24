@@ -58,7 +58,6 @@ fn VertexFlow_ExtractJsonValue str key = (
 )
 
 -- === OMNI-DIRECTIONAL RELINKER ===
--- [ИЗМЕНЕНИЕ 1.1] Добавлен опциональный аргумент targetNodes. 
 fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
     if texPath == undefined or texPath == "" do return false
     
@@ -80,10 +79,13 @@ fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
         for cls in cat do (
             try (
                 local instances = #()
-                -- [ИЗМЕНЕНИЕ 1.2] Если переданы выделенные объекты, ищем текстуры ТОЛЬКО на них (через параметр target:)
+                
+                -- [ИЗМЕНЕНИЕ 1] Убрали флаг processAllAnimatables:true для targetNodes
+                -- Почему прошлый код не работал: processAllAnimatables принудительно заставлял 3ds Max игнорировать target: и сканировать всю сцену.
+                -- Как работает новый код: Если передана импортированная модель, мы используем только target, запирая релинкер строго внутри нее.
                 if targetNodes != unsupplied and targetNodes != undefined then (
                     if targetNodes.count > 0 do (
-                        instances = getClassInstances cls target:targetNodes processAllAnimatables:true
+                        instances = getClassInstances cls target:targetNodes
                     )
                 ) else (
                     instances = getClassInstances cls processAllAnimatables:true
@@ -156,28 +158,32 @@ fn VertexFlow_ProcessTask sender args = (
                             local ext = toLower (getFilenameType mPath)
                             local importSuccess = false
                             
-                            -- [ИЗМЕНЕНИЕ 1.3] Снимаем выделение со сцены ДО импорта
                             clearSelection()
                             local preImportObjects = objects as array
                             
                             if ext == ".max" then (
-                                -- [ИЗМЕНЕНИЕ 2.1] Проверяем булевый результат объединения сцены. Флаг #select сам выделит модель.
                                 local mergeResult = mergeMAXFile mPath #mergeDups #select quiet:true
                                 
                                 if mergeResult == true then (
                                     importSuccess = true
                                 ) else (
-                                    -- [ИЗМЕНЕНИЕ 2.2] БЕЗОПАСНАЯ ПРОВЕРКА ВЕРСИИ. 
-                                    -- Используем execute в try/catch, чтобы не вызвать краш на старых 3ds Max.
+                                    -- [ИЗМЕНЕНИЕ 2] Нативный, прямой вызов getMaxFileVersion
+                                    -- Почему прошлый код не работал: execute() крашился из-за экранирования путей со слэшами.
+                                    -- Как работает новый код: Мы используем встроенную функцию напрямую. Она возвращает массив.
+                                    -- Мы проверяем массив и вычисляем реальный год выпуска программы: (Internal Version / 1000) + 1998.
                                     local fileVerInfo = undefined
-                                    try ( fileVerInfo = execute ("getMaxFileVersion @\"" + mPath + "\"") ) catch()
+                                    try ( fileVerInfo = getMaxFileVersion mPath ) catch()
                                     
-                                    local curVerInfo = maxVersion()
-                                    local curYear = (curVerInfo[1] / 1000) + 1998
-                                    
-                                    if fileVerInfo != undefined and classOf fileVerInfo == Array and fileVerInfo.count > 0 and fileVerInfo[1] > curVerInfo[1] then (
+                                    if fileVerInfo != undefined and classOf fileVerInfo == Array and fileVerInfo.count > 0 then (
+                                        local curVerInfo = maxVersion()
+                                        local curYear = (curVerInfo[1] / 1000) + 1998
                                         local fileYear = (fileVerInfo[1] / 1000) + 1998
-                                        VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + (fileYear as string) + ". You use " + (curYear as string) + ".") isError:true
+                                        
+                                        if fileVerInfo[1] > curVerInfo[1] then (
+                                            VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + (fileYear as string) + ". You use " + (curYear as string) + ".") isError:true
+                                        ) else (
+                                            VertexFlow_LogMsg "Import Error: Failed to merge .max file (Corrupted or unsupported)." isError:true
+                                        )
                                     ) else (
                                         VertexFlow_LogMsg "Import Error: Failed to merge .max file." isError:true
                                     )
@@ -195,10 +201,10 @@ fn VertexFlow_ProcessTask sender args = (
                             )
                             
                             if importSuccess then (
-                                -- [ИЗМЕНЕНИЕ 1.4] Твоя идея в действии! Берем выделенные объекты.
+                                -- Берем только что импортированные объекты (они выделены автоматически)
                                 local importedNodes = getCurrentSelection() as array
                                 
-                                -- На всякий случай, если FBX/OBJ не выделились автоматически, выделяем их вручную
+                                -- Запасной вариант для сторонних форматов
                                 if importedNodes.count == 0 then (
                                     local newNodes = #()
                                     for obj in objects do (
@@ -210,7 +216,7 @@ fn VertexFlow_ProcessTask sender args = (
                                     )
                                 )
                                 
-                                -- [ИЗМЕНЕНИЕ 1.5] Передаем ТОЛЬКО выделенную модель в релинкер!
+                                -- Передаем в релинкер только выделенные (новые) объекты
                                 if tPath != "" and importedNodes.count > 0 do (
                                     VertexFlow_RelinkAssets tPath targetNodes:importedNodes
                                 )
