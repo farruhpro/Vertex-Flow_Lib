@@ -38,11 +38,6 @@ fn VertexFlow_LogMsg msg isError:false = (
     if VertexFlow_UpdateUI != undefined do VertexFlow_UpdateUI()
 )
 
-fn VertexFlow_NormalizePath p = (
-    if p == undefined or p == "" then return ""
-    return toLower (substituteString p "\\" "/")
-)
-
 fn VertexFlow_ExtractJsonValue str key = (
     local dnStr = dotNetObject "System.String" str
     local searchKey = "\"" + key + "\""
@@ -57,59 +52,86 @@ fn VertexFlow_ExtractJsonValue str key = (
     return dnStr.Substring pStart (pEnd - pStart)
 )
 
--- === РЕЛИНКЕР ТОЛЬКО ДЛЯ ИМПОРТИРОВАННОЙ МОДЕЛИ ===
-fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
-    if texPath == undefined or texPath == "" do return false
+-- === ИДЕАЛЬНЫЙ РЕЛИНКЕР ТОЛЬКО ДЛЯ ИМПОРТИРОВАННОЙ МОДЕЛИ ===
+fn VertexFlow_RelinkAssets texPath targetNodes = (
+    if texPath == undefined or texPath == "" or targetNodes == undefined or targetNodes.count == 0 do return false
     
-    local normTexPath = substituteString texPath "/" "\\"
-    if substring normTexPath normTexPath.count 1 == "\\" do (
-        normTexPath = substring normTexPath 1 (normTexPath.count - 1)
+    -- Нативная нормализация пути (исправляет проблему пустых путей в Asset Tracking)
+    local safeTexPath = pathConfig.normalizePath texPath
+    local propsToCheck = #("filename", "HDRIMapName", "mapName", "ies_file", "iesFile", "file", "proxy_file")
+    local relinkedCount = 0
+    
+    local allMatsAndMaps = #()
+    local nodesToProcess = #()
+    
+    -- Собираем объекты и их корневые материалы
+    for obj in targetNodes do (
+        appendIfUnique nodesToProcess obj
+        if hasProperty obj "material" and obj.material != undefined do appendIfUnique allMatsAndMaps obj.material
     )
     
-    local relinkedCount = 0
-    local propsToCheck = #("filename", "HDRIMapName", "mapName", "ies_file", "iesFile", "file", "proxy_file")
-    local categories = #(textureMap.classes, GeometryClass.classes, light.classes)
+    -- БЕЗОПАСНЫЙ ИТЕРАТИВНЫЙ ОБХОД МАТЕРИАЛОВ (Без рекурсий, без крашей)
+    local i = 1
+    while i <= allMatsAndMaps.count do (
+        local currentItem = allMatsAndMaps[i]
+        
+        if hasProperty currentItem "getNumSubMtls" do (
+            local num = getNumSubMtls currentItem
+            for j = 1 to num do (
+                local sm = getSubMtl currentItem j
+                if sm != undefined do appendIfUnique allMatsAndMaps sm
+            )
+        )
+        
+        if hasProperty currentItem "getNumSubTexmaps" do (
+            local num = getNumSubTexmaps currentItem
+            for j = 1 to num do (
+                local st = getSubTexmap currentItem j
+                if st != undefined do appendIfUnique allMatsAndMaps st
+            )
+        )
+        i += 1
+    )
     
-    -- Собираем в массив саму геометрию и её материалы
-    local searchTargets = #()
-    if targetNodes != unsupplied and targetNodes != undefined then (
-        for obj in targetNodes do (
-            appendIfUnique searchTargets obj
-            if hasProperty obj "material" and obj.material != undefined do (
-                appendIfUnique searchTargets obj.material
+    -- Назначаем пути строго через нативный pathConfig.appendPath
+    for item in allMatsAndMaps do (
+        for p in propsToCheck do (
+            if hasProperty item p do (
+                try (
+                    local oldPath = getProperty item p
+                    if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
+                        local fName = filenameFromPath oldPath
+                        if fName != "" do (
+                            local newPath = pathConfig.appendPath safeTexPath fName
+                            if (toLower oldPath) != (toLower newPath) do (
+                                setProperty item p newPath
+                                relinkedCount += 1
+                            )
+                        )
+                    )
+                ) catch()
             )
         )
     )
     
-    for cat in categories do (
-        for cls in cat do (
-            try (
-                local instances = #()
-                -- Ищем текстуры строго внутри собранных материалов новой модели
-                if searchTargets.count > 0 then (
-                    instances = getClassInstances cls target:searchTargets
-                ) else (
-                    instances = getClassInstances cls processAllAnimatables:true
-                )
-                
-                for inst in instances do (
-                    for p in propsToCheck do (
-                        if hasProperty inst p do (
-                            local oldPath = getProperty inst p
-                            if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
-                                local fName = filenameFromPath oldPath
-                                local newPath = normTexPath + "\\" + fName
-                                
-                                if (toLower oldPath) != (toLower newPath) do (
-                                    -- Жесткая перезапись пути без проверки на наличие файла
-                                    setProperty inst p newPath
-                                    relinkedCount += 1
-                                )
+    -- То же самое для геометрии (для Proxy и IES)
+    for item in nodesToProcess do (
+        for p in propsToCheck do (
+            if hasProperty item p do (
+                try (
+                    local oldPath = getProperty item p
+                    if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
+                        local fName = filenameFromPath oldPath
+                        if fName != "" do (
+                            local newPath = pathConfig.appendPath safeTexPath fName
+                            if (toLower oldPath) != (toLower newPath) do (
+                                setProperty item p newPath
+                                relinkedCount += 1
                             )
                         )
                     )
-                )
-            ) catch()
+                ) catch()
+            )
         )
     )
     
@@ -119,7 +141,7 @@ fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
     if relinkedCount > 0 then (
         VertexFlow_LogMsg ("Relinked " + (relinkedCount as string) + " paths for imported model.")
     ) else (
-        VertexFlow_LogMsg ("No textures found for relinking in the imported model.")
+        VertexFlow_LogMsg ("No matching textures found for relinking in imported model.")
     )
 )
 
@@ -141,47 +163,51 @@ fn VertexFlow_ProcessTask sender args = (
             local tPath = VertexFlow_ExtractJsonValue fileContent "textures_path" 
             
             if mPath != "" and pPath != "" then (
-                local currentMaxPath = maxFilePath + maxFileName
+                -- Нормализуем пути, чтобы 3ds Max не сходил с ума от прямых слешей
+                local safeMaxPath = pathConfig.normalizePath (maxFilePath + maxFileName)
+                local safePPath = pathConfig.normalizePath pPath
+                local safeMPath = pathConfig.normalizePath mPath
                 
-                if currentMaxPath == "" then (
+                if safeMaxPath == "" then (
                     VertexFlow_LogMsg "Scene is not saved!" isError:true
                     try(deleteFile taskFile)catch()
-                ) else if (VertexFlow_NormalizePath currentMaxPath) == (VertexFlow_NormalizePath pPath) then (
+                ) else if (toLower safeMaxPath) == (toLower safePPath) then (
                     
                     try(deleteFile taskFile)catch()
                     
-                    local fileNameFull = filenameFromPath mPath
+                    local fileNameFull = filenameFromPath safeMPath
                     VertexFlow_LogMsg ("Importing: " + fileNameFull)
                     
-                    if doesFileExist mPath then (
+                    if doesFileExist safeMPath then (
                         try (
-                            local ext = toLower (getFilenameType mPath)
+                            local ext = toLower (getFilenameType safeMPath)
                             local importSuccess = false
                             
-                            -- Запоминаем сцену до импорта
                             clearSelection()
                             local preImportObjects = objects as array
                             
                             if ext == ".max" then (
-                                local mergeResult = mergeMAXFile mPath #mergeDups #select quiet:true
+                                local mergeResult = mergeMAXFile safeMPath #mergeDups #select quiet:true
                                 
                                 if mergeResult == true then (
                                     importSuccess = true
                                 ) else (
-                                    -- === НАТИВНЫЙ ОБРАБОТЧИК ВЕРСИИ ===
-                                    local fileYear = "Newer Version"
-                                    try (
-                                        local fileVer = getMaxFileVersion mPath
-                                        if fileVer != undefined and classOf fileVer == Array and fileVer.count > 0 do (
-                                            fileYear = ((fileVer[1] / 1000) + 1998) as string
-                                        )
-                                    ) catch()
+                                    -- ЧТЕНИЕ ВЕРСИИ НОВОЙ МОДЕЛИ (Работает 100% благодаря safeMPath)
+                                    local fileVerInfo = undefined
+                                    try ( fileVerInfo = getMaxFileVersion safeMPath ) catch()
                                     
-                                    local curYear = (((maxVersion())[1] / 1000) + 1998) as string
-                                    VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + fileYear + ". You use " + curYear + ".") isError:true
+                                    if fileVerInfo != undefined and classOf fileVerInfo == Array and fileVerInfo.count > 0 then (
+                                        local fileYear = ((fileVerInfo[1] / 1000) + 1998) as string
+                                        local curYear = (((maxVersion())[1] / 1000) + 1998) as string
+                                        VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + fileYear + ". You use " + curYear + ".") isError:true
+                                    ) else (
+                                        -- Запасной вариант, если файл вообще поврежден
+                                        local curYear = (((maxVersion())[1] / 1000) + 1998) as string
+                                        VertexFlow_LogMsg ("Import Error: Model version is unsupported (Newer than " + curYear + " or corrupted).") isError:true
+                                    )
                                 )
                             ) else if ext == ".fbx" or ext == ".obj" then (
-                                local impResult = importFile mPath #noPrompt
+                                local impResult = importFile safeMPath #noPrompt
                                 if impResult == true do importSuccess = true
                             ) else (
                                 VertexFlow_LogMsg ("Format " + ext + " not supported!") isError:true
@@ -189,20 +215,23 @@ fn VertexFlow_ProcessTask sender args = (
                             )
                             
                             if importSuccess then (
-                                -- Собираем только что импортированные объекты
-                                local importedNodes = #()
-                                for obj in objects do (
-                                    if findItem preImportObjects obj == 0 do append importedNodes obj
+                                local importedNodes = getCurrentSelection() as array
+                                if importedNodes.count == 0 then (
+                                    local newNodes = #()
+                                    for obj in objects do (
+                                        if findItem preImportObjects obj == 0 do append newNodes obj
+                                    )
+                                    if newNodes.count > 0 do (
+                                        select newNodes
+                                        importedNodes = newNodes
+                                    )
                                 )
-                                -- Резервный вариант, если новые объекты слились с существующими
-                                if importedNodes.count == 0 do importedNodes = getCurrentSelection() as array
                                 
-                                if importedNodes.count > 0 do (
-                                    select importedNodes
-                                    -- Передаем объекты в релинкер
-                                    if tPath != "" do VertexFlow_RelinkAssets tPath targetNodes:importedNodes
-                                    max zoomext sel
+                                if tPath != "" and importedNodes.count > 0 do (
+                                    VertexFlow_RelinkAssets tPath importedNodes
                                 )
+                                
+                                if importedNodes.count > 0 do max zoomext sel
                                 VertexFlow_LogMsg "Success! Model added." isError:false
                             )
                         ) catch (
