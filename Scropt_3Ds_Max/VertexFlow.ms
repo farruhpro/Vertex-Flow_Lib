@@ -57,6 +57,23 @@ fn VertexFlow_ExtractJsonValue str key = (
     return dnStr.Substring pStart (pEnd - pStart)
 )
 
+-- ИСПРАВЛЕНИЕ: Вынесли рекурсивную функцию в глобальную область, 
+-- чтобы компилятор MAXScript больше не сходил с ума от вложенности.
+fn VertexFlow_CollectMatsAndMaps m arr = (
+    if m == undefined do return false
+    if findItem arr m > 0 do return false
+    append arr m
+    
+    if hasProperty m "getNumSubMtls" do (
+        local numMtls = getNumSubMtls m
+        for i = 1 to numMtls do VertexFlow_CollectMatsAndMaps (getSubMtl m i) arr
+    )
+    if hasProperty m "getNumSubTexmaps" do (
+        local numMaps = getNumSubTexmaps m
+        for i = 1 to numMaps do VertexFlow_CollectMatsAndMaps (getSubTexmap m i) arr
+    )
+)
+
 -- === РЕКУРСИВНЫЙ РЕЛИНКЕР ТОЛЬКО ДЛЯ ВЫДЕЛЕННЫХ ОБЪЕКТОВ ===
 fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
     if texPath == undefined or texPath == "" or targetNodes == undefined or targetNodes.count == 0 do return false
@@ -71,25 +88,9 @@ fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
     
     local allMatsAndMaps = #()
     
-    -- ИСПРАВЛЕНИЕ: Передаем массив arr внутрь как аргумент, чтобы обойти изоляцию scope в MAXScript
-    fn collectMatsAndMaps m arr = (
-        if m == undefined do return false
-        if findItem arr m > 0 do return false
-        append arr m
-        
-        if hasProperty m "getNumSubMtls" do (
-            local numMtls = getNumSubMtls m
-            for i = 1 to numMtls do collectMatsAndMaps (getSubMtl m i) arr
-        )
-        if hasProperty m "getNumSubTexmaps" do (
-            local numMaps = getNumSubTexmaps m
-            for i = 1 to numMaps do collectMatsAndMaps (getSubTexmap m i) arr
-        )
-    )
-    
     -- Собираем материалы импортированных объектов + сами объекты (для Proxy/IES)
     for obj in targetNodes do (
-        if hasProperty obj "material" and obj.material != undefined do collectMatsAndMaps obj.material allMatsAndMaps
+        if hasProperty obj "material" and obj.material != undefined do VertexFlow_CollectMatsAndMaps obj.material allMatsAndMaps
         appendIfUnique allMatsAndMaps obj
     )
     
