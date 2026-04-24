@@ -132,13 +132,29 @@ def vertex_flow_listener():
 # --- РЕГИСТРАЦИЯ ---
 classes = (VIEW3D_PT_vertex_flow, VF_OT_clear_logs)
 
-def register():
-    for cls in classes:
-        # Защита от двойной регистрации (чтобы Blender не ругался)
-        if not hasattr(bpy.types, cls.__name__):
-            bpy.utils.register_class(cls)
+# 1. Функция отложенного запуска (ждет полной загрузки Blender)
+@bpy.app.handlers.persistent
+def vf_start_timer_handler(dummy):
     if not bpy.app.timers.is_registered(vertex_flow_listener):
         bpy.app.timers.register(vertex_flow_listener)
+
+# 2. Основная регистрация
+def register():
+    for cls in classes:
+        # Защита от дублирования интерфейса
+        if not hasattr(bpy.types, cls.__name__):
+            bpy.utils.register_class(cls)
+    
+    # Пробуем запустить слушатель (сработает при ручной установке)
+    if not bpy.app.timers.is_registered(vertex_flow_listener):
+        try:
+            bpy.app.timers.register(vertex_flow_listener)
+        except Exception:
+            pass # Если загрузка ранняя — игнорируем ошибку
+            
+    # Вешаем хук, который гарантированно запустит слушатель после старта Blender
+    if vf_start_timer_handler not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(vf_start_timer_handler)
 
 def unregister():
     for cls in reversed(classes):
@@ -146,10 +162,13 @@ def unregister():
             bpy.utils.unregister_class(cls)
     if bpy.app.timers.is_registered(vertex_flow_listener):
         bpy.app.timers.unregister(vertex_flow_listener)
+    # Убираем хук при удалении скрипта
+    if vf_start_timer_handler in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(vf_start_timer_handler)
 
-# Стандартный запуск
-if __name__ == "__main__":
+# 3. Железобетонный автозапуск для папки startup
+# Blender сам не вызывает register() из папки startup, поэтому мы делаем это принудительно
+try:
     register()
-# АВТОЗАПУСК ДЛЯ ПАПКИ STARTUP:
-elif "startup" in os.path.basename(os.path.dirname(__file__)).lower():
-    register()
+except Exception:
+    pass
