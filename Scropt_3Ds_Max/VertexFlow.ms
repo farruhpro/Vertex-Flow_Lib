@@ -17,10 +17,13 @@
     )
 )
 
+-- Предварительная декларация всех глобальных переменных для защиты от багов компилятора 3ds Max
 global VertexFlow_Log = #()
 global VertexFlow_UpdateUI
 global VertexFlow_Timer
 global VertexFlowListenerUI 
+global VertexFlow_ProcessTask
+global VertexFlow_CollectMatsAndMaps
 
 fn VertexFlow_PadZero num = (
     local s = num as string
@@ -57,21 +60,25 @@ fn VertexFlow_ExtractJsonValue str key = (
     return dnStr.Substring pStart (pEnd - pStart)
 )
 
--- ИСПРАВЛЕНИЕ: Вынесли рекурсивную функцию в глобальную область, 
--- чтобы компилятор MAXScript больше не сходил с ума от вложенности.
+-- ГЛОБАЛЬНАЯ РЕКУРСИВНАЯ ФУНКЦИЯ СБОРА МАТЕРИАЛОВ (С защитой try-catch)
 fn VertexFlow_CollectMatsAndMaps m arr = (
     if m == undefined do return false
     if findItem arr m > 0 do return false
     append arr m
     
-    if hasProperty m "getNumSubMtls" do (
-        local numMtls = getNumSubMtls m
-        for i = 1 to numMtls do VertexFlow_CollectMatsAndMaps (getSubMtl m i) arr
-    )
-    if hasProperty m "getNumSubTexmaps" do (
-        local numMaps = getNumSubTexmaps m
-        for i = 1 to numMaps do VertexFlow_CollectMatsAndMaps (getSubTexmap m i) arr
-    )
+    try (
+        if hasProperty m "getNumSubMtls" do (
+            local numMtls = getNumSubMtls m
+            for i = 1 to numMtls do VertexFlow_CollectMatsAndMaps (getSubMtl m i) arr
+        )
+    ) catch()
+    
+    try (
+        if hasProperty m "getNumSubTexmaps" do (
+            local numMaps = getNumSubTexmaps m
+            for i = 1 to numMaps do VertexFlow_CollectMatsAndMaps (getSubTexmap m i) arr
+        )
+    ) catch()
 )
 
 -- === РЕКУРСИВНЫЙ РЕЛИНКЕР ТОЛЬКО ДЛЯ ВЫДЕЛЕННЫХ ОБЪЕКТОВ ===
@@ -98,19 +105,21 @@ fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
     for item in allMatsAndMaps do (
         for p in propsToCheck do (
             if hasProperty item p do (
-                local oldPath = getProperty item p
-                if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
-                    local fName = filenameFromPath oldPath
-                    if fName != "" do (
-                        local newPath = normTexPath + "\\" + fName
-                        if (toLower oldPath) != (toLower newPath) do (
-                            if doesFileExist newPath then (
+                try (
+                    local oldPath = getProperty item p
+                    if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
+                        local fName = filenameFromPath oldPath
+                        if fName != "" do (
+                            local newPath = normTexPath + "\\" + fName
+                            if (toLower oldPath) != (toLower newPath) do (
+                                -- ЖЕСТКАЯ ЗАПИСЬ: мы убрали проверку наличия файла, 
+                                -- чтобы путь прописался в любом случае, даже если скачивание еще идет!
                                 setProperty item p newPath
                                 relinkedCount += 1
                             )
                         )
                     )
-                )
+                ) catch()
             )
         )
     )
@@ -255,70 +264,69 @@ fn VertexFlow_ProcessTask sender args = (
             )
         )
     )
-)
 
-try(destroyDialog VertexFlowListenerUI)catch()
-rollout VertexFlowListenerUI "Vertex Flow: Console" width:350 height:320
-(
-    label lblStatus "Status: [ LISTENING ]" pos:[10,10] width:330
-    label lblLastAction "-" pos:[10,30] width:330
-    button btnToggle "Stop Listening" pos:[10,50] width:330 height:30
-    button btnManual "Manual Check" pos:[10,85] width:330 height:25
-    label lblLogTitle "Event Log:" pos:[10,120]
-    edittext txtLog "" pos:[10,140] width:330 height:165 readOnly:true
-    
-    fn UpdateUI = (
-        local fullText = ""
-        for msg in VertexFlow_Log do fullText += msg + "\r\n"
-        txtLog.text = fullText
-        if VertexFlow_Log.count > 0 do lblLastAction.text = VertexFlow_Log[1]
+    try(destroyDialog VertexFlowListenerUI)catch()
+    rollout VertexFlowListenerUI "Vertex Flow: Console" width:350 height:320
+    (
+        label lblStatus "Status: [ LISTENING ]" pos:[10,10] width:330
+        label lblLastAction "-" pos:[10,30] width:330
+        button btnToggle "Stop Listening" pos:[10,50] width:330 height:30
+        button btnManual "Manual Check" pos:[10,85] width:330 height:25
+        label lblLogTitle "Event Log:" pos:[10,120]
+        edittext txtLog "" pos:[10,140] width:330 height:165 readOnly:true
         
-        if VertexFlow_Timer != undefined and VertexFlow_Timer.Enabled then (
-            lblStatus.text = "Status: [ LISTENING ]"
-            btnToggle.text = "Stop Listening"
-        ) else (
-            lblStatus.text = "Status: [ DISABLED ]"
-            btnToggle.text = "Start Listening"
-        )
-    )
-    
-    on VertexFlowListenerUI open do ( VertexFlow_UpdateUI = UpdateUI; UpdateUI() )
-    on VertexFlowListenerUI close do ( VertexFlow_UpdateUI = undefined )
-    
-    on btnToggle pressed do (
-        if VertexFlow_Timer != undefined do (
-            if VertexFlow_Timer.Enabled then (
-                VertexFlow_Timer.Stop()
-                VertexFlow_LogMsg "Listening stopped." isError:true
+        fn UpdateUI = (
+            local fullText = ""
+            for msg in VertexFlow_Log do fullText += msg + "\r\n"
+            txtLog.text = fullText
+            if VertexFlow_Log.count > 0 do lblLastAction.text = VertexFlow_Log[1]
+            
+            if VertexFlow_Timer != undefined and VertexFlow_Timer.Enabled then (
+                lblStatus.text = "Status: [ LISTENING ]"
+                btnToggle.text = "Stop Listening"
             ) else (
-                VertexFlow_Timer.Start()
-                VertexFlow_LogMsg "Listening started." isError:false
+                lblStatus.text = "Status: [ DISABLED ]"
+                btnToggle.text = "Start Listening"
             )
         )
+        
+        on VertexFlowListenerUI open do ( VertexFlow_UpdateUI = UpdateUI; UpdateUI() )
+        on VertexFlowListenerUI close do ( VertexFlow_UpdateUI = undefined )
+        
+        on btnToggle pressed do (
+            if VertexFlow_Timer != undefined do (
+                if VertexFlow_Timer.Enabled then (
+                    VertexFlow_Timer.Stop()
+                    VertexFlow_LogMsg "Listening stopped." isError:true
+                ) else (
+                    VertexFlow_Timer.Start()
+                    VertexFlow_LogMsg "Listening started." isError:false
+                )
+            )
+        )
+        on btnManual pressed do ( VertexFlow_ProcessTask undefined undefined )
     )
-    on btnManual pressed do ( VertexFlow_ProcessTask undefined undefined )
-)
 
-global VertexFlow_OpenUI
-fn VertexFlow_OpenUI = (
-    try(destroyDialog VertexFlowListenerUI)catch()
-    createDialog VertexFlowListenerUI style:#(#style_toolwindow, #style_sysmenu)
-)
-
-if VertexFlow_Timer == undefined do (
-    VertexFlow_Timer = dotNetObject "System.Windows.Forms.Timer"
-    VertexFlow_Timer.interval = 1000
-    dotNet.addEventHandler VertexFlow_Timer "Tick" VertexFlow_ProcessTask
-    VertexFlow_Timer.start()
-    VertexFlow_LogMsg "Background listener started." isError:false
-)
-
-macroScript VertexFlow_UI
-category:"Vertex Flow"
-buttonText:"Vertex Flow Console"
-toolTip:"Open Vertex Flow Console"
-(
-    on execute do (
-        if VertexFlow_OpenUI != undefined do VertexFlow_OpenUI()
+    global VertexFlow_OpenUI
+    fn VertexFlow_OpenUI = (
+        try(destroyDialog VertexFlowListenerUI)catch()
+        createDialog VertexFlowListenerUI style:#(#style_toolwindow, #style_sysmenu)
     )
-)
+
+    if VertexFlow_Timer == undefined do (
+        VertexFlow_Timer = dotNetObject "System.Windows.Forms.Timer"
+        VertexFlow_Timer.interval = 1000
+        dotNet.addEventHandler VertexFlow_Timer "Tick" VertexFlow_ProcessTask
+        VertexFlow_Timer.start()
+        VertexFlow_LogMsg "Background listener started." isError:false
+    )
+
+    macroScript VertexFlow_UI
+    category:"Vertex Flow"
+    buttonText:"Vertex Flow Console"
+    toolTip:"Open Vertex Flow Console"
+    (
+        on execute do (
+            if VertexFlow_OpenUI != undefined do VertexFlow_OpenUI()
+        )
+    )
