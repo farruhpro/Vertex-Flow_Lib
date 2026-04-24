@@ -57,8 +57,9 @@ fn VertexFlow_ExtractJsonValue str key = (
     return dnStr.Substring pStart (pEnd - pStart)
 )
 
--- === OMNI-DIRECTIONAL RELINKER ===
-fn VertexFlow_RelinkAssets texPath targetNodes = (
+-- === РЕКУРСИВНЫЙ РЕЛИНКЕР ТОЛЬКО ДЛЯ ВЫДЕЛЕННЫХ ОБЪЕКТОВ ===
+-- Без слепков, без глобальных getClassInstances. Спускается строго по дереву материалов.
+fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
     if texPath == undefined or texPath == "" or targetNodes == undefined or targetNodes.count == 0 do return false
     
     local normTexPath = substituteString texPath "/" "\\"
@@ -66,44 +67,53 @@ fn VertexFlow_RelinkAssets texPath targetNodes = (
         normTexPath = substring normTexPath 1 (normTexPath.count - 1)
     )
     
-    -- [ИЗМЕНЕНИЕ 1.1] Явный сбор графа материалов.
-    -- Почему прошлый код ломался: getClassInstances target:Nodes не заходит внутрь материалов геометрии.
-    -- Как работает новый код: Мы берем импортированные модели и кладем в массив поиска не только их, но и их МАТЕРИАЛЫ.
-    -- Теперь поиск пойдет строго внутрь этих материалов и найдет все текстуры.
-    local searchTargets = #()
-    for obj in targetNodes do (
-        appendIfUnique searchTargets obj
-        if hasProperty obj "material" and obj.material != undefined do appendIfUnique searchTargets obj.material
-    )
-    
     local relinkedCount = 0
     local propsToCheck = #("filename", "HDRIMapName", "mapName", "ies_file", "iesFile", "file", "proxy_file")
-    local categories = #(textureMap.classes, GeometryClass.classes, light.classes)
     
-    for cat in categories do (
-        for cls in cat do (
-            try (
-                local instances = getClassInstances cls target:searchTargets
-                for inst in instances do (
-                    for p in propsToCheck do (
-                        if hasProperty inst p do (
-                            local oldPath = getProperty inst p
-                            if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
-                                local fName = filenameFromPath oldPath
-                                local newPath = normTexPath + "\\" + fName
-                                
-                                if (toLower oldPath) != (toLower newPath) do (
-                                    -- [ИЗМЕНЕНИЕ 1.2] Принудительная запись пути (удалено doesFileExist)
-                                    -- Почему прошлый код ставил пустые пути или пути разработчика: Если текстуры еще не было в папке, скрипт отказывался писать путь.
-                                    -- Как работает новый: Мы ЖЕСТКО записываем новый путь из JSON. Asset Tracking 100% примет его.
-                                    setProperty inst p newPath
-                                    relinkedCount += 1
-                                )
+    -- Массив для сбора всех найденных элементов
+    local allMatsAndMaps = #()
+    
+    -- Функция рекурсивного погружения в материалы
+    fn collectMatsAndMaps m = (
+        if m == undefined do return false
+        if findItem allMatsAndMaps m > 0 do return false
+        append allMatsAndMaps m
+        
+        if hasProperty m "getNumSubMtls" do (
+            local numMtls = getNumSubMtls m
+            for i = 1 to numMtls do collectMatsAndMaps (getSubMtl m i)
+        )
+        if hasProperty m "getNumSubTexmaps" do (
+            local numMaps = getNumSubTexmaps m
+            for i = 1 to numMaps do collectMatsAndMaps (getSubTexmap m i)
+        )
+    )
+    
+    -- Собираем материалы импортированных объектов + сами объекты (для Proxy/IES)
+    for obj in targetNodes do (
+        if hasProperty obj "material" and obj.material != undefined do collectMatsAndMaps obj.material
+        appendIfUnique allMatsAndMaps obj
+    )
+    
+    -- Применяем пути
+    for item in allMatsAndMaps do (
+        for p in propsToCheck do (
+            if hasProperty item p do (
+                local oldPath = getProperty item p
+                if oldPath != undefined and classOf oldPath == String and oldPath != "" do (
+                    local fName = filenameFromPath oldPath
+                    if fName != "" do (
+                        local newPath = normTexPath + "\\" + fName
+                        if (toLower oldPath) != (toLower newPath) do (
+                            -- Переписываем путь ТОЛЬКО если текстура реально скачалась в папку!
+                            if doesFileExist newPath then (
+                                setProperty item p newPath
+                                relinkedCount += 1
                             )
                         )
                     )
                 )
-            ) catch()
+            )
         )
     )
     
@@ -113,7 +123,7 @@ fn VertexFlow_RelinkAssets texPath targetNodes = (
     if relinkedCount > 0 then (
         VertexFlow_LogMsg ("Relinked " + (relinkedCount as string) + " paths for imported model.")
     ) else (
-        VertexFlow_LogMsg ("No textures found for relinking in the imported model.")
+        VertexFlow_LogMsg ("No matching textures found for relinking.")
     )
 )
 
@@ -161,9 +171,7 @@ fn VertexFlow_ProcessTask sender args = (
                                 if mergeResult == true then (
                                     importSuccess = true
                                 ) else (
-                                    -- [ИЗМЕНЕНИЕ 2] Бронебойный сканер версии файла.
-                                    -- Если нативный getMaxFileVersion не может прочитать файл из будущего, 
-                                    -- мы читаем его бинарный код через .NET и ищем строку "3ds Max 20XX".
+                                    -- === БИНАРНЫЙ ПАРСЕР ВЕРСИИ ===
                                     local detectedYear = ""
                                     local fileVerInfo = undefined
                                     try ( fileVerInfo = getMaxFileVersion mPath ) catch()
@@ -171,28 +179,41 @@ fn VertexFlow_ProcessTask sender args = (
                                     if fileVerInfo != undefined and classOf fileVerInfo == Array and fileVerInfo.count > 0 then (
                                         detectedYear = ((fileVerInfo[1] / 1000) + 1998) as string
                                     ) else (
-                                        -- Бинарный парсинг (Fallback)
+                                        -- Если штатная функция 3ds Max не осилила новую версию файла:
+                                        -- Читаем первые и последние 100КБ как бинарный текст и ищем метаданные.
                                         try (
                                             local fs = (dotNetClass "System.IO.File").OpenRead mPath
                                             local br = dotNetObject "System.IO.BinaryReader" fs
-                                            local headerBytes = br.ReadBytes 8192
+                                            
+                                            local len = fs.Length
+                                            local firstChunkSize = if len < 100000 then len else 100000
+                                            local firstBytes = br.ReadBytes firstChunkSize
+                                            
+                                            local lastBytes = #()
+                                            if len > 100000 do (
+                                                fs.Seek -100000 (dotNetClass "System.IO.SeekOrigin").End
+                                                lastBytes = br.ReadBytes 100000
+                                            )
                                             br.Close()
                                             fs.Close()
                                             
                                             local headerStr = ""
-                                            for b in headerBytes do ( if b >= 32 and b <= 126 then headerStr += bit.intAsChar b )
+                                            -- Фильтруем нулевые байты (UTF-16) и оставляем только читаемый текст
+                                            for b in firstBytes do ( if b >= 32 and b <= 126 do headerStr += bit.intAsChar b )
+                                            for b in lastBytes do ( if b >= 32 and b <= 126 do headerStr += bit.intAsChar b )
                                             
-                                            local idx = findString headerStr "3ds Max 20"
+                                            local idx = findString headerStr "3ds Max "
                                             if idx != undefined then (
                                                 detectedYear = substring headerStr (idx + 8) 4
                                             ) else (
-                                                detectedYear = "Newer Version"
+                                                detectedYear = "Unknown Newer"
                                             )
-                                        ) catch ( detectedYear = "Newer Version" )
+                                        ) catch ( detectedYear = "Unknown Newer" )
                                     )
                                     
-                                    local curYear = ((maxVersion())[1] / 1000) + 1998
-                                    VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + detectedYear + ". You use " + (curYear as string) + ".") isError:true
+                                    local curVerInfo = maxVersion()
+                                    local curYear = ((curVerInfo[1] / 1000) + 1998) as string
+                                    VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + detectedYear + ". You use " + curYear + ".") isError:true
                                 )
                             ) else if ext == ".fbx" or ext == ".obj" then (
                                 local importResult = importFile mPath #noPrompt
@@ -207,7 +228,6 @@ fn VertexFlow_ProcessTask sender args = (
                             )
                             
                             if importSuccess then (
-                                -- Собираем импортированные объекты
                                 local importedNodes = getCurrentSelection() as array
                                 if importedNodes.count == 0 then (
                                     local newNodes = #()
@@ -220,9 +240,9 @@ fn VertexFlow_ProcessTask sender args = (
                                     )
                                 )
                                 
-                                -- Запускаем релинкер с передачей правильных узлов
+                                -- Запуск релинкера строго по дереву материалов
                                 if tPath != "" and importedNodes.count > 0 do (
-                                    VertexFlow_RelinkAssets tPath importedNodes
+                                    VertexFlow_RelinkTargetedNodes tPath importedNodes
                                 )
                                 
                                 if importedNodes.count > 0 do max zoomext sel
