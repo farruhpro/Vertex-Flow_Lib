@@ -58,7 +58,6 @@ fn VertexFlow_ExtractJsonValue str key = (
 )
 
 -- === РЕКУРСИВНЫЙ РЕЛИНКЕР ТОЛЬКО ДЛЯ ВЫДЕЛЕННЫХ ОБЪЕКТОВ ===
--- Без слепков, без глобальных getClassInstances. Спускается строго по дереву материалов.
 fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
     if texPath == undefined or texPath == "" or targetNodes == undefined or targetNodes.count == 0 do return false
     
@@ -70,28 +69,27 @@ fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
     local relinkedCount = 0
     local propsToCheck = #("filename", "HDRIMapName", "mapName", "ies_file", "iesFile", "file", "proxy_file")
     
-    -- Массив для сбора всех найденных элементов
     local allMatsAndMaps = #()
     
-    -- Функция рекурсивного погружения в материалы
-    fn collectMatsAndMaps m = (
+    -- ИСПРАВЛЕНИЕ: Передаем массив arr внутрь как аргумент, чтобы обойти изоляцию scope в MAXScript
+    fn collectMatsAndMaps m arr = (
         if m == undefined do return false
-        if findItem allMatsAndMaps m > 0 do return false
-        append allMatsAndMaps m
+        if findItem arr m > 0 do return false
+        append arr m
         
         if hasProperty m "getNumSubMtls" do (
             local numMtls = getNumSubMtls m
-            for i = 1 to numMtls do collectMatsAndMaps (getSubMtl m i)
+            for i = 1 to numMtls do collectMatsAndMaps (getSubMtl m i) arr
         )
         if hasProperty m "getNumSubTexmaps" do (
             local numMaps = getNumSubTexmaps m
-            for i = 1 to numMaps do collectMatsAndMaps (getSubTexmap m i)
+            for i = 1 to numMaps do collectMatsAndMaps (getSubTexmap m i) arr
         )
     )
     
     -- Собираем материалы импортированных объектов + сами объекты (для Proxy/IES)
     for obj in targetNodes do (
-        if hasProperty obj "material" and obj.material != undefined do collectMatsAndMaps obj.material
+        if hasProperty obj "material" and obj.material != undefined do collectMatsAndMaps obj.material allMatsAndMaps
         appendIfUnique allMatsAndMaps obj
     )
     
@@ -105,7 +103,6 @@ fn VertexFlow_RelinkTargetedNodes texPath targetNodes = (
                     if fName != "" do (
                         local newPath = normTexPath + "\\" + fName
                         if (toLower oldPath) != (toLower newPath) do (
-                            -- Переписываем путь ТОЛЬКО если текстура реально скачалась в папку!
                             if doesFileExist newPath then (
                                 setProperty item p newPath
                                 relinkedCount += 1
@@ -171,7 +168,6 @@ fn VertexFlow_ProcessTask sender args = (
                                 if mergeResult == true then (
                                     importSuccess = true
                                 ) else (
-                                    -- === БИНАРНЫЙ ПАРСЕР ВЕРСИИ ===
                                     local detectedYear = ""
                                     local fileVerInfo = undefined
                                     try ( fileVerInfo = getMaxFileVersion mPath ) catch()
@@ -179,8 +175,6 @@ fn VertexFlow_ProcessTask sender args = (
                                     if fileVerInfo != undefined and classOf fileVerInfo == Array and fileVerInfo.count > 0 then (
                                         detectedYear = ((fileVerInfo[1] / 1000) + 1998) as string
                                     ) else (
-                                        -- Если штатная функция 3ds Max не осилила новую версию файла:
-                                        -- Читаем первые и последние 100КБ как бинарный текст и ищем метаданные.
                                         try (
                                             local fs = (dotNetClass "System.IO.File").OpenRead mPath
                                             local br = dotNetObject "System.IO.BinaryReader" fs
@@ -198,7 +192,6 @@ fn VertexFlow_ProcessTask sender args = (
                                             fs.Close()
                                             
                                             local headerStr = ""
-                                            -- Фильтруем нулевые байты (UTF-16) и оставляем только читаемый текст
                                             for b in firstBytes do ( if b >= 32 and b <= 126 do headerStr += bit.intAsChar b )
                                             for b in lastBytes do ( if b >= 32 and b <= 126 do headerStr += bit.intAsChar b )
                                             
@@ -240,7 +233,6 @@ fn VertexFlow_ProcessTask sender args = (
                                     )
                                 )
                                 
-                                -- Запуск релинкера строго по дереву материалов
                                 if tPath != "" and importedNodes.count > 0 do (
                                     VertexFlow_RelinkTargetedNodes tPath importedNodes
                                 )
