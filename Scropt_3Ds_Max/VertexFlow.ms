@@ -58,6 +58,7 @@ fn VertexFlow_ExtractJsonValue str key = (
 )
 
 -- === OMNI-DIRECTIONAL RELINKER ===
+-- [ИЗМЕНЕНИЕ 1.1] Добавлен опциональный параметр targetNodes.
 fn VertexFlow_RelinkAssets texPath targetNodes:unsupplied = (
     if texPath == undefined or texPath == "" do return false
     
@@ -154,10 +155,10 @@ fn VertexFlow_ProcessTask sender args = (
                         try (
                             local ext = toLower (getFilenameType mPath)
                             local importSuccess = false
-
+                            
                             -- [ИЗМЕНЕНИЕ 1.3] Делаем снимок всех объектов сцены ДО импорта модели.
                             local preImportObjects = objects as array
-
+                            
                             if ext == ".max" then (
                                 -- [ИЗМЕНЕНИЕ 2.1] Читаем результат работы функции, а не слепо доверяем процессу.
                                 local mergeResult = mergeMAXFile mPath #mergeDups #select quiet:true
