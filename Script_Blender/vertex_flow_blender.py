@@ -1,10 +1,12 @@
 bl_info = {
     "name": "Vertex Flow Integration",
-    "author": "Farrukh Gulamjanov",
+    "author": "Farrukh Gulamzhanov",
     "version": (1, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Vertex Flow",
     "description": "Интеграция с Vertex Flow: Авто-импорт и лог событий",
+    "doc_url": "https://farrukh.pro",               # <--- Кнопка "Сайт/Документация"
+    "tracker_url": "https://farrukh.pro/#About",  # <--- Кнопка "Контакты/Поддержка"
     "category": "Import-Export",
 }
 
@@ -59,6 +61,15 @@ class VF_OT_clear_logs(bpy.types.Operator):
         VF_Logs.messages.clear()
         return {'FINISHED'}
 
+# [ДОБАВЛЕНО]: Функция обратной связи для Rust.
+# Вместо удаления файла, мы перезаписываем его с новым статусом.
+def vertex_flow_write_result(filepath, status, msg):
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump({"status": status, "message": msg}, f)
+    except Exception:
+        pass
+
 # --- ЛОГИКА ИМПОРТА ---
 def relink_textures(textures_dir):
     if not textures_dir or not os.path.exists(textures_dir):
@@ -86,22 +97,30 @@ def vertex_flow_listener():
         with open(task_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
+        # [ДОБАВЛЕНО]: Проверяем статус. Если задача уже выполнена или с ошибкой — игнорируем ее.
+        # Это защищает от бесконечного цикла, пока Rust не удалит файл.
+        status = data.get("status", "")
+        if status in ["completed", "error"]:
+            return 1.0
+        
         model_path = data.get("model_path", "")
         project_path = data.get("project_path", "")
         textures_path = data.get("textures_path", "")
 
         if not model_path or not project_path:
-            os.remove(task_file)
+            # Сообщаем об ошибке вместо удаления файла
+            vertex_flow_write_result(task_file, "error", "Invalid JSON payload")
             return 1.0
 
         current_path = bpy.data.filepath
         if not current_path:
             VF_Logs.add("ОШИБКА: Сцена не сохранена!")
-            os.remove(task_file)
+            # Сообщаем об ошибке вместо удаления
+            vertex_flow_write_result(task_file, "error", "Scene is not saved")
             return 1.0
 
+        # Проверяем, что этот файл проекта — именно тот, в который нужно импортировать
         if os.path.normpath(current_path).lower() == os.path.normpath(project_path).lower():
-            os.remove(task_file)
             
             if os.path.exists(model_path):
                 ext = os.path.splitext(model_path)[1].lower()
@@ -117,15 +136,27 @@ def vertex_flow_listener():
                 elif ext == ".obj":
                     if hasattr(bpy.ops.wm, "obj_import"): bpy.ops.wm.obj_import(filepath=model_path)
                     else: bpy.ops.import_scene.obj(filepath=model_path)
+                else:
+                    # [ДОБАВЛЕНО]: Обработка неподдерживаемого формата
+                    VF_Logs.add(f"ОШИБКА: Формат {ext} не поддерживается")
+                    vertex_flow_write_result(task_file, "error", f"Unsupported format: {ext}")
+                    return 1.0
                 
                 if textures_path:
                     relink_textures(textures_path)
                 
                 VF_Logs.add("✅ Готово")
+                # Главный момент Handshake! Сообщаем Rust, что импорт завершен успешно
+                vertex_flow_write_result(task_file, "completed", "Success")
+            else:
+                VF_Logs.add("ОШИБКА: Файл модели не найден на диске")
+                # Сообщаем Rust, что файл физически отсутствует
+                vertex_flow_write_result(task_file, "error", "Model file not found on disk")
                 
     except Exception as e:
         VF_Logs.add(f"Ошибка: {str(e)[:30]}...")
-        if os.path.exists(task_file): os.remove(task_file)
+        # Сообщаем Rust о критическом сбое Blender
+        vertex_flow_write_result(task_file, "error", f"Blender crash: {str(e)[:50]}")
 
     return 1.0
 
