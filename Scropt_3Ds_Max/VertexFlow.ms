@@ -161,6 +161,10 @@ fn VertexFlow_ProcessTask sender args = (
                 local pPath = VertexFlow_ExtractJsonValue fileContent "project_path"
                 local tPath = VertexFlow_ExtractJsonValue fileContent "textures_path" 
                 
+                -- === ДОБАВЛЕНО: ЧИТАЕМ ПАРАМЕТР ПЕРЕЛИНКОВКИ (для тумблера запрещающего замену сущ. текстур) ===
+                local relinkStr = VertexFlow_ExtractJsonValue fileContent "relink_textures"
+                local shouldRelink = (relinkStr == "true")
+
                 if mPath != "" and pPath != "" then (
                 local safeMaxPath = substituteString (maxFilePath + maxFileName) "/" "\\"
                     local safePPath = substituteString pPath "/" "\\"
@@ -237,7 +241,8 @@ fn VertexFlow_ProcessTask sender args = (
                                     
                                     if importedNodes.count > 0 do (
                                         select importedNodes
-                                        if tPath != "" do VertexFlow_RelinkAssets tPath importedNodes
+                                        -- === ДОБАВЛЕНО: ПРОВЕРКА НАСТРОЙКИ (тумблер замены сущ. текстур) ===
+                                        if tPath != "" and shouldRelink do VertexFlow_RelinkAssets tPath importedNodes
                                         max zoomext sel
                                     )
                                     VertexFlow_LogMsg "Success! Model added." isError:false
