@@ -132,6 +132,9 @@ fn VertexFlow_WriteTaskResult file status msg = (
 )
 
 fn VertexFlow_ProcessTask sender args = (
+    -- [ИСПРАВЛЕНИЕ 1]: Останавливаем таймер на время импорта, чтобы не было двойных срабатываний
+    if VertexFlow_Timer != undefined do VertexFlow_Timer.Stop()
+
     local tempDir = sysInfo.tempdir
     local taskFile = tempDir + "\\vertex_flow_task.json"
     
@@ -141,115 +144,128 @@ fn VertexFlow_ProcessTask sender args = (
             local ioFile = dotNetClass "System.IO.File"
             local encoding = dotNetClass "System.Text.Encoding"
             fileContent = ioFile.ReadAllText taskFile encoding.UTF8
-        ) catch ( return false )
+        ) catch ( 
+            -- Если файл заблокирован, просто возобновляем таймер и выходим
+            if VertexFlow_Timer != undefined do VertexFlow_Timer.Start()
+            return false 
+        )
         
         if fileContent != "" do (
-            local mPath = VertexFlow_ExtractJsonValue fileContent "model_path"
-            local pPath = VertexFlow_ExtractJsonValue fileContent "project_path"
-            local tPath = VertexFlow_ExtractJsonValue fileContent "textures_path" 
+            -- [ИСПРАВЛЕНИЕ 2]: Проверяем, не записали ли мы уже ответ в этот файл
+            local currentStatus = VertexFlow_ExtractJsonValue fileContent "status"
             
-            if mPath != "" and pPath != "" then (
-               local safeMaxPath = substituteString (maxFilePath + maxFileName) "/" "\\"
-                local safePPath = substituteString pPath "/" "\\"
-                local safeMPath = substituteString mPath "/" "\\"
+            -- Выполняем код ТОЛЬКО если статус еще не completed и не error
+            if currentStatus != "completed" and currentStatus != "error" do (
                 
-                if safeMaxPath == "" then (
-                    VertexFlow_LogMsg "Scene is not saved!" isError:true
-                    -- [ИЗМЕНЕНО]: Записываем ошибку в файл, Rust сам всё очистит
-                    VertexFlow_WriteTaskResult taskFile "error" "Scene is not saved"
-                ) else if (toLower safeMaxPath) == (toLower safePPath) then (
-                    -- [УДАЛЕНО]: try(deleteFile taskFile)catch() - Больше не удаляем файл!
+                local mPath = VertexFlow_ExtractJsonValue fileContent "model_path"
+                local pPath = VertexFlow_ExtractJsonValue fileContent "project_path"
+                local tPath = VertexFlow_ExtractJsonValue fileContent "textures_path" 
+                
+                if mPath != "" and pPath != "" then (
+                local safeMaxPath = substituteString (maxFilePath + maxFileName) "/" "\\"
+                    local safePPath = substituteString pPath "/" "\\"
+                    local safeMPath = substituteString mPath "/" "\\"
                     
-                    local fileNameFull = filenameFromPath safeMPath
-                    VertexFlow_LogMsg ("Importing: " + fileNameFull)
-                    
-                    if doesFileExist safeMPath then (
-                        try (
-                            local ext = toLower (getFilenameType safeMPath)
-                            local importSuccess = false
-                            
-                            clearSelection()
-                            local preImportObjects = objects as array
-                            
-                            if ext == ".max" then (
-                                local mergeResult = mergeMAXFile safeMPath #mergeDups #select quiet:true
+                    if safeMaxPath == "" then (
+                        VertexFlow_LogMsg "Scene is not saved!" isError:true
+                        -- [ИЗМЕНЕНО]: Записываем ошибку в файл, Rust сам всё очистит
+                        VertexFlow_WriteTaskResult taskFile "error" "Scene is not saved"
+                    ) else if (toLower safeMaxPath) == (toLower safePPath) then (
+                        -- [УДАЛЕНО]: try(deleteFile taskFile)catch() - Больше не удаляем файл!
+                        
+                        local fileNameFull = filenameFromPath safeMPath
+                        VertexFlow_LogMsg ("Importing: " + fileNameFull)
+                        
+                        if doesFileExist safeMPath then (
+                            try (
+                                local ext = toLower (getFilenameType safeMPath)
+                                local importSuccess = false
                                 
-                                if mergeResult == true then (
-                                    importSuccess = true
-                                ) else (
-                                    VertexFlow_ParsedYear = "Unknown"
-                                    local pyScript = "import pymxs\n"
-                                    pyScript += "try:\n"
-                                    pyScript += "    with open(r'" + safeMPath + "', 'rb') as f:\n"
-                                    pyScript += "        data = f.read(50000000)\n"
-                                    pyScript += "        pattern = bytes([51,0,100,0,115,0,32,0,77,0,97,0,120,0,32,0,50,0,48,0])\n"
-                                    pyScript += "        idx = data.find(pattern)\n"
-                                    pyScript += "        if idx != -1:\n"
-                                    pyScript += "            ver_bytes = data[idx:idx+24]\n"
-                                    pyScript += "            ver = ver_bytes.decode('utf-16-le').replace(chr(0), '').strip()\n"
-                                    pyScript += "            pymxs.runtime.VertexFlow_ParsedYear = ver.split(' ')[-1]\n"
-                                    pyScript += "except Exception as e:\n"
-                                    pyScript += "    pass\n"
+                                clearSelection()
+                                local preImportObjects = objects as array
+                                
+                                if ext == ".max" then (
+                                    local mergeResult = mergeMAXFile safeMPath #mergeDups #select quiet:true
                                     
-                                    try ( python.Execute pyScript ) catch()
-                                    
-                                    local fileYear = VertexFlow_ParsedYear
-                                    if fileYear == "Unknown" do fileYear = "Newer Version"
-                                    
-                                    local curYear = (((maxVersion())[1] / 1000) + 1998) as string
-                                    VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + fileYear + ". You use " + curYear + ".") isError:true
-                                    
-                                    -- [ДОБАВЛЕНО]: Сообщаем Rust, что версия не подходит
-                                    VertexFlow_WriteTaskResult taskFile "error" ("Version mismatch: " + fileYear)
-                                )
-                            ) else if ext == ".fbx" or ext == ".obj" then (
-                                local impResult = importFile safeMPath #noPrompt
-                                if impResult == true do importSuccess = true
-                            ) else (
-                                VertexFlow_LogMsg ("Format " + ext + " not supported!") isError:true
-                                -- [ДОБАВЛЕНО]: Сообщаем об ошибке формата
-                                VertexFlow_WriteTaskResult taskFile "error" "Unsupported format"
-                                return false
-                            )
-                            
-                            if importSuccess then (
-                                local importedNodes = getCurrentSelection() as array
-                                if importedNodes.count == 0 then (
-                                    local newNodes = #()
-                                    for obj in objects do (
-                                        if findItem preImportObjects obj == 0 do append newNodes obj
+                                    if mergeResult == true then (
+                                        importSuccess = true
+                                    ) else (
+                                        VertexFlow_ParsedYear = "Unknown"
+                                        local pyScript = "import pymxs\n"
+                                        pyScript += "try:\n"
+                                        pyScript += "    with open(r'" + safeMPath + "', 'rb') as f:\n"
+                                        pyScript += "        data = f.read(50000000)\n"
+                                        pyScript += "        pattern = bytes([51,0,100,0,115,0,32,0,77,0,97,0,120,0,32,0,50,0,48,0])\n"
+                                        pyScript += "        idx = data.find(pattern)\n"
+                                        pyScript += "        if idx != -1:\n"
+                                        pyScript += "            ver_bytes = data[idx:idx+24]\n"
+                                        pyScript += "            ver = ver_bytes.decode('utf-16-le').replace(chr(0), '').strip()\n"
+                                        pyScript += "            pymxs.runtime.VertexFlow_ParsedYear = ver.split(' ')[-1]\n"
+                                        pyScript += "except Exception as e:\n"
+                                        pyScript += "    pass\n"
+                                        
+                                        try ( python.Execute pyScript ) catch()
+                                        
+                                        local fileYear = VertexFlow_ParsedYear
+                                        if fileYear == "Unknown" do fileYear = "Newer Version"
+                                        
+                                        local curYear = (((maxVersion())[1] / 1000) + 1998) as string
+                                        VertexFlow_LogMsg ("Import Error: Model is 3ds Max " + fileYear + ". You use " + curYear + ".") isError:true
+                                        
+                                        -- [ДОБАВЛЕНО]: Сообщаем Rust, что версия не подходит
+                                        VertexFlow_WriteTaskResult taskFile "error" ("Version mismatch: " + fileYear)
                                     )
-                                    importedNodes = newNodes
+                                ) else if ext == ".fbx" or ext == ".obj" then (
+                                    local impResult = importFile safeMPath #noPrompt
+                                    if impResult == true do importSuccess = true
+                                ) else (
+                                    VertexFlow_LogMsg ("Format " + ext + " not supported!") isError:true
+                                    -- [ДОБАВЛЕНО]: Сообщаем об ошибке формата
+                                    VertexFlow_WriteTaskResult taskFile "error" "Unsupported format"
+                                    return false
                                 )
                                 
-                                if importedNodes.count > 0 do (
-                                    select importedNodes
-                                    if tPath != "" do VertexFlow_RelinkAssets tPath importedNodes
-                                    max zoomext sel
+                                if importSuccess then (
+                                    local importedNodes = getCurrentSelection() as array
+                                    if importedNodes.count == 0 then (
+                                        local newNodes = #()
+                                        for obj in objects do (
+                                            if findItem preImportObjects obj == 0 do append newNodes obj
+                                        )
+                                        importedNodes = newNodes
+                                    )
+                                    
+                                    if importedNodes.count > 0 do (
+                                        select importedNodes
+                                        if tPath != "" do VertexFlow_RelinkAssets tPath importedNodes
+                                        max zoomext sel
+                                    )
+                                    VertexFlow_LogMsg "Success! Model added." isError:false
+                                    
+                                    -- [ДОБАВЛЕНО]: Главный момент Handshake. Сообщаем Rust, что импорт завершен!
+                                    VertexFlow_WriteTaskResult taskFile "completed" "Success"
                                 )
-                                VertexFlow_LogMsg "Success! Model added." isError:false
-                                
-                                -- [ДОБАВЛЕНО]: Главный момент Handshake. Сообщаем Rust, что импорт завершен!
-                                VertexFlow_WriteTaskResult taskFile "completed" "Success"
+                            ) catch (
+                                local err = getCurrentException()
+                                VertexFlow_LogMsg ("CRASH: " + err) isError:true
+                                -- [ДОБАВЛЕНО]: Если упал сам 3ds Max, разблокируем UI
+                                VertexFlow_WriteTaskResult taskFile "error" "3ds Max Internal Crash"
                             )
-                        ) catch (
-                            local err = getCurrentException()
-                            VertexFlow_LogMsg ("CRASH: " + err) isError:true
-                            -- [ДОБАВЛЕНО]: Если упал сам 3ds Max, разблокируем UI
-                            VertexFlow_WriteTaskResult taskFile "error" "3ds Max Internal Crash"
+                        ) else (
+                            VertexFlow_LogMsg "File not found on disk!" isError:true
+                            VertexFlow_WriteTaskResult taskFile "error" "File not found"
                         )
-                    ) else (
-                        VertexFlow_LogMsg "File not found on disk!" isError:true
-                        VertexFlow_WriteTaskResult taskFile "error" "File not found"
                     )
+                ) else (
+                    -- [УДАЛЕНО]: try(deleteFile taskFile)catch() - Убираем удаление при невалидном JSON
+                    VertexFlow_LogMsg "Invalid JSON." isError:true
+                    VertexFlow_WriteTaskResult taskFile "error" "Invalid JSON"
                 )
-            ) else (
-                -- [УДАЛЕНО]: try(deleteFile taskFile)catch() - Убираем удаление при невалидном JSON
-                VertexFlow_LogMsg "Invalid JSON." isError:true
-                VertexFlow_WriteTaskResult taskFile "error" "Invalid JSON"
             )
         )
     )
+-- [ИСПРАВЛЕНИЕ 1]: Обязательно запускаем таймер снова, чтобы он ждал следующие модели
+    if VertexFlow_Timer != undefined do VertexFlow_Timer.Start()
 )
 
 try(destroyDialog VertexFlowListenerUI)catch()
