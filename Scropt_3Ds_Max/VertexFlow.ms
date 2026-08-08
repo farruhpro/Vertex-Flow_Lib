@@ -29,7 +29,10 @@ global VertexFlow_JSONSerializer
 global VF_MIN_MAX_MAJOR = 24000 -- 3ds Max 2022
 global VF_MAX_TASK_BYTES = 4194304
 global VF_MAX_TASK_AGE_MS = 600000L
-global VF_TASK_FILE = (getDir #temp) + "\\vertex_flow_task.json"
+-- sysInfo.tempdir — документированный системный Temp в MAXScript.
+-- Path.Combine исключает ручную склейку разделителей и формирует тот же путь,
+-- который использует Rust на Windows.
+global VF_TASK_FILE = (dotNetClass "System.IO.Path").Combine sysInfo.tempdir "vertex_flow_task.json"
 global VF_FILE_PROPERTIES = #(
     #filename, #fileName, #file, #mapName, #HDRIMapName,
     #sourceFile, #sourceFilename, #textureFile, #bitmapFile,
@@ -109,32 +112,53 @@ fn VF_AtomicWrite text jobId = (
         if fileClass.Exists temporary do fileClass.Delete temporary
         if fileClass.Exists backup do fileClass.Delete backup
         fileClass.WriteAllText temporary text utf8
-        if fileClass.Exists VF_TASK_FILE then (
+        -- Владение повторно проверяется непосредственно перед
+        -- File.Replace. Это закрывает узкое окно гонки удаления/замены файла.
+        if (VF_TaskFileBelongsToJob jobId) then (
             fileClass.Replace temporary VF_TASK_FILE backup true
-            if fileClass.Exists backup do fileClass.Delete backup
+            -- Удаление служебной backup-копии больше не определяет
+            -- успех уже состоявшейся атомарной публикации. Раньше редкий сбой
+            -- File.Delete после успешного File.Replace попадал во внешний catch:
+            -- Rust мог увидеть terminal-ответ, а 3ds Max считал запись ошибочной
+            -- и запускал rollback. Теперь backup очищается best-effort, а успех
+            -- определяется исключительно результатом File.Replace.
+            try(if fileClass.Exists backup do fileClass.Delete backup)catch()
+            true
         ) else (
-            fileClass.Move temporary VF_TASK_FILE
+            if fileClass.Exists temporary do fileClass.Delete temporary
+            false
         )
-        true
     ) catch (
         try(if fileClass.Exists temporary do fileClass.Delete temporary)catch()
+        -- Неуспешный File.Replace также не оставляет служебную
+        -- backup-копию. Она не участвует в протоколе и безопасно удаляется.
+        try(if fileClass.Exists backup do fileClass.Delete backup)catch()
         false
     )
 )
 
 fn VF_WriteResult task status code message warnings:#() detailsJson:"{}" = (
-    local jobJson = "\"" + VF_JsonEscape task.jobId + "\""
-    local codeJson = if code == undefined then "null" else ("\"" + VF_JsonEscape code + "\"")
-    local payload = "{\"job_id\":" + jobJson
-    payload += ",\"status\":\"" + VF_JsonEscape status + "\""
-    payload += ",\"code\":" + codeJson
-    payload += ",\"message\":\"" + VF_JsonEscape message + "\""
-    payload += ",\"warnings\":" + VF_StringArrayJson warnings
-    payload += ",\"details\":" + detailsJson + "}"
-    if not (VF_AtomicWrite payload task.jobId) then (
-        VertexFlow_LogMsg "ERR_RESULT_WRITE: cannot publish response" level:"ERROR"
+    -- Перед каждым ответом мост проверяет, что общий task-файл
+    -- всё ещё существует и принадлежит этому job_id. При закрытии Vertex Flow
+    -- Rust удаляет задание; без этой проверки поздний completed/error заново
+    -- создавал бы JSON и оставлял ложное «занятое» задание для следующего запуска.
+    if not (VF_TaskFileBelongsToJob task.jobId) then (
+        VertexFlow_LogMsg "TASK_CANCELLED: task file was removed or replaced" level:"WARNING"
         false
-    ) else true
+    ) else (
+        local jobJson = "\"" + VF_JsonEscape task.jobId + "\""
+        local codeJson = if code == undefined then "null" else ("\"" + VF_JsonEscape code + "\"")
+        local payload = "{\"job_id\":" + jobJson
+        payload += ",\"status\":\"" + VF_JsonEscape status + "\""
+        payload += ",\"code\":" + codeJson
+        payload += ",\"message\":\"" + VF_JsonEscape message + "\""
+        payload += ",\"warnings\":" + VF_StringArrayJson warnings
+        payload += ",\"details\":" + detailsJson + "}"
+        if not (VF_AtomicWrite payload task.jobId) then (
+            VertexFlow_LogMsg "ERR_RESULT_WRITE: cannot publish response" level:"ERROR"
+            false
+        ) else true
+    )
 )
 
 fn VF_InitJson = (
@@ -156,6 +180,40 @@ fn VF_DictHas dictionary key = (
 
 fn VF_DictGet dictionary key defaultValue:undefined = (
     if VF_DictHas dictionary key then try(dictionary.Item[key])catch(defaultValue) else defaultValue
+)
+
+fn VF_TaskFileBelongsToJob jobId = (
+    -- Проверка владельца выполняется через тот же штатный
+    -- JavaScriptSerializer, что и основной разбор задания. Здесь намеренно нет
+    -- fallback-парсера: отсутствующий, повреждённый или заменённый файл безопасно
+    -- считается отменённым заданием и никогда не перезаписывается мостом.
+    local fileClass = dotNetClass "System.IO.File"
+    if not (fileClass.Exists VF_TASK_FILE) then false
+    else if not (VF_InitJson()) then false
+    else (
+        local utf8 = dotNetObject "System.Text.UTF8Encoding" false
+        local raw = try(fileClass.ReadAllText VF_TASK_FILE utf8)catch(undefined)
+        if raw == undefined then false
+        else (
+            local root = try(VertexFlow_JSONSerializer.DeserializeObject raw)catch(undefined)
+            if root == undefined then false
+            else (
+                local owner = VF_DictGet root "job_id" undefined
+                if owner == undefined then false else ((owner as string) == (jobId as string))
+            )
+        )
+    )
+)
+
+fn VF_RequireTaskOwnership task = (
+    -- Контрольные точки транзакции превращают удаление задания
+    -- при закрытии Vertex Flow в штатную отмену. Исключение попадает в уже
+    -- существующий transactional catch, после чего удаляются только ресурсы,
+    -- созданные текущим импортом, и восстанавливается состояние пользователя.
+    if not (VF_TaskFileBelongsToJob task.jobId) do (
+        VF_Fail "ERR_TASK_CANCELLED" "Vertex Flow task was cancelled"
+    )
+    true
 )
 
 fn VF_AsString value fieldName allowEmpty:false = (
@@ -606,11 +664,24 @@ fn VF_ExecuteTransaction task = (
     local warnings = #()
     local importedNodes = #()
     try (
+        -- До первого изменения сцены убеждаемся, что приложение
+        -- не закрылось и всё ещё ожидает результат именно этого задания.
+        VF_RequireTaskOwnership task
         if not (VF_ImportModel task) do VF_Fail "ERR_IMPORT_FAILED" "3ds Max importer returned false"
+        -- mergeMAXFile/importFile выполняются синхронно. Если
+        -- Vertex Flow закрылся во время штатного импортёра, удаление task-файла
+        -- обнаруживается сразу после его возврата и запускает rollback.
+        VF_RequireTaskOwnership task
         importedNodes = VF_GetNewNodes snapshot
         if importedNodes.count == 0 do VF_Fail "ERR_NO_IMPORTED_OBJECTS" "Importer created no new nodes"
         VF_LocalizeImportedNodes importedNodes snapshot
+        -- Вторая контрольная точка не позволяет продолжить
+        -- переназначение путей после отмены задания приложением.
+        VF_RequireTaskOwnership task
         local relinked = VF_RelinkImported task importedNodes snapshot warnings journal
+        -- Финальная контрольная точка выполняется до подтверждения
+        -- транзакции. Отмена во время обхода материалов также приводит к rollback.
+        VF_RequireTaskOwnership task
         VF_VerifyExistingScene snapshot
         VF_RestoreUserState snapshot strict:true
         VF_RefreshAssetTracking strict:true
@@ -643,19 +714,44 @@ fn VertexFlow_ProcessTask sender eventArgs = (
         task = VF_ReadTask()
         if task == undefined or not (VF_ValidateTask task) then ok
         else (
-            VF_WriteResult task "processing" undefined "3ds Max is processing the task"
-            VertexFlow_LogMsg ("Import started: " + filenameFromPath task.modelPath)
-            local result = VF_ExecuteTransaction task
-            if result[1] then (
-                VF_WriteResult task result[2] undefined (if result[3].count > 0 then "Import completed with warnings" else "Import completed") warnings:result[3] detailsJson:result[4]
-                -- [ИЗМЕНЕНО]: job_id всегда обязателен, поэтому условная
-                -- legacy-ветка для пустого идентификатора удалена.
-                append VertexFlow_ProcessedJobs task.jobId
-                if VertexFlow_ProcessedJobs.count > 128 do deleteItem VertexFlow_ProcessedJobs 1
-                VertexFlow_LogMsg (if result[3].count > 0 then "Import completed with warnings" else "Import completed") level:(if result[3].count > 0 then "WARNING" else "INFO")
+            -- Теперь импорт начинается только после успешной публикации processing.
+            if not (VF_WriteResult task "processing" undefined "3ds Max is processing the task") then (
+                VertexFlow_LogMsg "TASK_CANCELLED: import was not started" level:"WARNING"
             ) else (
-                VF_WriteResult task result[2] VertexFlow_LastErrorCode "Import failed" warnings:result[3] detailsJson:result[4]
-                VertexFlow_LogMsg (VertexFlow_LastErrorCode + ": Import failed") level:"ERROR"
+                VertexFlow_LogMsg ("Import started: " + filenameFromPath task.modelPath)
+                local result = VF_ExecuteTransaction task
+                if result[1] then (
+                    local finalMessage = if result[3].count > 0 then "Import completed with warnings" else "Import completed"
+                    if (VF_WriteResult task result[2] undefined finalMessage warnings:result[3] detailsJson:result[4]) then (
+                        -- [ИЗМЕНЕНО]: Задание считается обработанным только после
+                        -- успешной публикации terminal-ответа. Это исключает ложный
+                        -- локальный success, который приложение никогда не увидело.
+                        append VertexFlow_ProcessedJobs task.jobId
+                        if VertexFlow_ProcessedJobs.count > 128 do deleteItem VertexFlow_ProcessedJobs 1
+                        VertexFlow_LogMsg finalMessage level:(if result[3].count > 0 then "WARNING" else "INFO")
+                    ) else (
+                        -- [ДОБАВЛЕНО]: Если Vertex Flow закрылся после завершения
+                        -- импортёра, но до публикации результата, успешная локальная
+                        -- транзакция откатывается. Мост не оставляет в коммерческой
+                        -- сцене импорт, который приложение считает отменённым.
+                        local cancelWarnings = VF_Rollback result[5] result[6]
+                        if cancelWarnings.count > 0 then (
+                            VertexFlow_LogMsg "ERR_ROLLBACK_FAILED: cancelled import was not fully rolled back" level:"ERROR"
+                        ) else (
+                            VertexFlow_LogMsg "TASK_CANCELLED: completed import was rolled back" level:"WARNING"
+                        )
+                    )
+                ) else (
+                    -- [ИЗМЕНЕНО]: Ошибка транзакции уже сопровождается rollback.
+                    -- Если приложение ещё работает, оно получает точный ответ;
+                    -- если task-файл удалён при закрытии, мост только фиксирует
+                    -- отмену в Listener и не воссоздаёт JSON.
+                    if (VF_WriteResult task result[2] VertexFlow_LastErrorCode "Import failed" warnings:result[3] detailsJson:result[4]) then (
+                        VertexFlow_LogMsg (VertexFlow_LastErrorCode + ": Import failed") level:"ERROR"
+                    ) else (
+                        VertexFlow_LogMsg (VertexFlow_LastErrorCode + ": rollback completed; response was not published") level:"WARNING"
+                    )
+                )
             )
         )
     ) catch (
@@ -722,12 +818,21 @@ if VertexFlow_Timer != undefined do (
 
 if (maxVersion())[1] < VF_MIN_MAX_MAJOR then (
     VertexFlow_LogMsg "ERR_MAX_VERSION_UNSUPPORTED: 3ds Max 2022 or newer is required" level:"ERROR"
+) else if not (VF_InitJson()) then (
+    -- [ДОБАВЛЕНО]: JSON backend проверяется до запуска Timer. Раньше listener
+    -- сообщал "started", даже если среда .NET не могла загрузить официальный
+    -- System.Web serializer; первое задание затем оставалось без ответа.
+    -- Явная ошибка не маскирует несовместимость среды под ожидание задания.
+    VertexFlow_LogMsg "ERR_JSON_BACKEND_UNAVAILABLE: System.Web JSON backend is unavailable" level:"ERROR"
 ) else (
     VertexFlow_Timer = dotNetObject "System.Windows.Forms.Timer"
     VertexFlow_Timer.interval = 1000
     dotNet.addEventHandler VertexFlow_Timer "Tick" VertexFlow_ProcessTask
     VertexFlow_Timer.Start()
     VertexFlow_LogMsg "Transactional bridge listener started"
+    -- Listener показывает фактический канал обмена. Это позволяет
+    -- сразу диагностировать расхождение Temp-путей без ручного поиска по диску.
+    VertexFlow_LogMsg ("Task channel: " + VF_TASK_FILE)
 )
 
 macroScript VertexFlow_UI
