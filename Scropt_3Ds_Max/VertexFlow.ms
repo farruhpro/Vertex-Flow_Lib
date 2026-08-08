@@ -178,7 +178,7 @@ fn VF_DictHas dictionary key = (
     try(dictionary.ContainsKey key)catch(false)
 )
 
-fn VF_DictGet dictionary key defaultValue:undefined = (
+fn VF_DictGet dictionary key defaultValue = (
     if VF_DictHas dictionary key then try(dictionary.Item[key])catch(defaultValue) else defaultValue
 )
 
