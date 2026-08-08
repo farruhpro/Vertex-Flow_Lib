@@ -1,5 +1,4 @@
 /*
-
     Vertex Flow transactional bridge for 3ds Max.
     Developer source format: .ms. Public release format: encrypted .mse created
     from this self-contained source with the standard MAXScript encryptScript().
@@ -64,7 +63,10 @@ struct VFSceneSnapshot (
     nodes = #(),
     nodeHandles = #(),
     selectedNodes = #(),
-    subObject = 0,
+    -- Autodesk documents that subObjectLevel is undefined whenever the Modify
+    -- panel is closed or the current stack item does not permit sub-object mode.
+    -- The snapshot must preserve that legitimate state instead of inventing 0.
+    subObject = undefined,
     nodeStates = #(),
     oldMaterials = #(),
     oldMaps = #(),
@@ -617,15 +619,82 @@ fn VF_VerifyExistingScene snapshot = (
 
 fn VF_RestoreUserState snapshot strict:false warnings:undefined = (
     local restoreFailed = false
-    try(clearSelection())catch(restoreFailed = true)
-    local validSelection = for nodeValue in snapshot.selectedNodes where isValidNode nodeValue collect nodeValue
-    if validSelection.count > 0 do try(select validSelection)catch(restoreFailed = true)
-    try(subObjectLevel = snapshot.subObject)catch(restoreFailed = true)
-    if snapshot.commandPanelMode != undefined do try(setCommandPanelTaskMode snapshot.commandPanelMode)catch(restoreFailed = true)
-    if selection.count != validSelection.count do restoreFailed = true
+    local failureStep = ""
+    local validSelection = #()
+
+    -- isValidNode is the documented MAXScript guard for a node reference that
+    -- may have been deleted. Never dereference a saved selection entry first.
+    for nodeValue in snapshot.selectedNodes do (
+        if isValidNode nodeValue then append validSelection nodeValue
+        else (
+            restoreFailed = true
+            if failureStep == "" do failureStep = "selected_node_invalid"
+        )
+    )
+
+    try(clearSelection())catch(
+        restoreFailed = true
+        if failureStep == "" do failureStep = "clear_selection"
+    )
+    if validSelection.count > 0 do try(select validSelection)catch(
+        restoreFailed = true
+        if failureStep == "" do failureStep = "restore_selection"
+    )
+
+    -- Restore the active panel before subObjectLevel. Autodesk defines
+    -- subObjectLevel only for the object currently open in the Modify panel.
+    if snapshot.commandPanelMode != undefined do try(
+        setCommandPanelTaskMode snapshot.commandPanelMode
+    )catch(
+        restoreFailed = true
+        if failureStep == "" do failureStep = "restore_command_panel"
+    )
+
+    -- undefined is a valid captured state, not a value that can be assigned.
+    -- In that case selection + command panel restoration already reconstructs
+    -- the same native state and no sub-object assignment is required.
+    if snapshot.subObject != undefined do try(
+        subObjectLevel = snapshot.subObject
+    )catch(
+        restoreFailed = true
+        if failureStep == "" do failureStep = "restore_sub_object_level"
+    )
+
+    -- Verify exact selection membership, not only the number of selected nodes.
+    local restoredSelection = try(selection as array)catch(
+        restoreFailed = true
+        if failureStep == "" do failureStep = "read_restored_selection"
+        #()
+    )
+    if restoredSelection.count != validSelection.count then (
+        restoreFailed = true
+        if failureStep == "" do failureStep = "verify_selection_count"
+    ) else (
+        for nodeValue in validSelection where (findItem restoredSelection nodeValue) == 0 do (
+            restoreFailed = true
+            if failureStep == "" do failureStep = "verify_selection_membership"
+        )
+    )
+
+    if snapshot.commandPanelMode != undefined do (
+        local restoredPanelMode = try(getCommandPanelTaskMode())catch(undefined)
+        if restoredPanelMode != snapshot.commandPanelMode do (
+            restoreFailed = true
+            if failureStep == "" do failureStep = "verify_command_panel"
+        )
+    )
+    if snapshot.subObject != undefined do (
+        local restoredSubObject = try(subObjectLevel)catch(undefined)
+        if restoredSubObject != snapshot.subObject do (
+            restoreFailed = true
+            if failureStep == "" do failureStep = "verify_sub_object_level"
+        )
+    )
+
     if restoreFailed then (
-        if warnings != undefined do append warnings "WARN_USER_STATE_RESTORE_FAILED"
-        if strict do VF_Fail "ERR_USER_STATE_RESTORE" "Cannot restore 3ds Max user state"
+        local diagnostic = if failureStep == "" then "unknown" else failureStep
+        if warnings != undefined do append warnings ("WARN_USER_STATE_RESTORE_FAILED: " + diagnostic)
+        if strict do VF_Fail "ERR_USER_STATE_RESTORE" ("Cannot restore 3ds Max user state [step=" + diagnostic + "]")
     )
     not restoreFailed
 )
@@ -674,7 +743,18 @@ fn VF_Rollback snapshot journal = (
         append warnings ("ROLLBACK_NEW_NODE_SCAN_FAILED: " + getCurrentException())
         #()
     )
-    for nodeValue in newNodes do try(delete nodeValue)catch(append warnings ("ROLLBACK_NODE_DELETE_FAILED: " + nodeValue.name))
+    -- delete is a documented mapped node operation. Deleting a parent/group can
+    -- invalidate another reference already stored in newNodes, so every saved
+    -- reference is checked immediately before use. Capture the stable handle
+    -- before deletion and never read .name from a node after delete has run.
+    for nodeValue in newNodes do (
+        if isValidNode nodeValue do (
+            local nodeHandle = try(getHandleByAnim nodeValue)catch(0)
+            try(delete nodeValue)catch(
+                append warnings ("ROLLBACK_NODE_DELETE_FAILED: handle=" + (nodeHandle as string))
+            )
+        )
+    )
     -- Remove only layers created by this operation, and only when no node remains.
     -- Ошибка чтения LayerManager больше не обрывает восстановление
     -- выделения, режима пользователя и Asset Tracking.
@@ -683,9 +763,19 @@ fn VF_Rollback snapshot journal = (
         #()
     )
     for layerValue in currentLayers where (findItem snapshot.layers layerValue) == 0 do (
+        -- Read the layer name before any deletion attempt. A successfully
+        -- deleted LayerProperties interface must never be dereferenced later.
+        local layerName = try(layerValue.name)catch(undefined)
         local layerNodes = #()
-        try(layerValue.nodes &layerNodes)catch()
-        if layerNodes.count == 0 do try(LayerManager.deleteLayerByName layerValue.name)catch(append warnings ("ROLLBACK_LAYER_DELETE_FAILED: " + layerValue.name))
+        local layerScanSucceeded = try(layerValue.nodes &layerNodes; true)catch(false)
+        if layerName == undefined then append warnings "ROLLBACK_LAYER_NAME_READ_FAILED"
+        else if not layerScanSucceeded then append warnings ("ROLLBACK_LAYER_NODE_SCAN_FAILED: " + layerName)
+        else if layerNodes.count == 0 do (
+            -- Autodesk documents a Boolean result: false means the layer was
+            -- not deleted (for example, because it is currently active).
+            local layerDeleted = try(LayerManager.deleteLayerByName layerName)catch(false)
+            if not layerDeleted do append warnings ("ROLLBACK_LAYER_DELETE_FAILED: " + layerName)
+        )
     )
     VF_RestoreUserState snapshot warnings:warnings
     VF_RefreshAssetTracking warnings:warnings
