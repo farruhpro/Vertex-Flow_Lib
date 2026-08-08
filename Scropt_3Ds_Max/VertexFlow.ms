@@ -131,7 +131,7 @@ fn VF_WriteResult task status code message warnings:#() detailsJson:"{}" = (
     payload += ",\"message\":\"" + VF_JsonEscape message + "\""
     payload += ",\"warnings\":" + VF_StringArrayJson warnings
     payload += ",\"details\":" + detailsJson + "}"
-    if not (VF_AtomicWrite payload task.jobId) do (
+    if not (VF_AtomicWrite payload task.jobId) then (
         VertexFlow_LogMsg "ERR_RESULT_WRITE: cannot publish response" level:"ERROR"
         false
     ) else true
