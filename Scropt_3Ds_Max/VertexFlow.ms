@@ -12,6 +12,7 @@
     обход и сброс могли менять/выгружать ресурсы существующей сцены.
     [УДАЛЕНО]: python.Execute с бинарным чтением .max для угадывания версии — это
     недокументированный хак; штатный importer теперь возвращает честную ошибку.
+
 */
 
 global VertexFlow_Timer
@@ -23,7 +24,7 @@ global VertexFlow_LastErrorCode = "ERR_MAX_INTERNAL"
 global VertexFlow_ProcessedJobs = #()
 global VertexFlow_JSONSerializer
 
--- [ИЗМЕНЕНО]: Timer вызывает функции уже после завершения fileIn/.ms.
+-- Timer вызывает функции уже после завершения fileIn/.ms.
 -- Поэтому runtime-константы объявлены явно global, а не как недолговечные
 -- top-level local: поведение исходного .ms и зашифрованного .mse совпадает.
 global VF_MIN_MAX_MAJOR = 24000 -- 3ds Max 2022
@@ -65,7 +66,7 @@ struct VFSceneSnapshot (
 )
 
 fn VertexFlow_LogMsg message level:"INFO" = (
-    -- [ИЗМЕНЕНО]: Одна диагностическая запись одновременно попадает в Listener
+    -- Одна диагностическая запись одновременно попадает в Listener
     -- и rollout; широкие catch() больше не скрывают производственные ошибки.
     local line = "[" + level + "] " + (message as string)
     format "[Vertex Flow] %\n" line
@@ -99,7 +100,7 @@ fn VF_StringArrayJson values = (
 )
 
 fn VF_AtomicWrite text jobId = (
-    -- [ИЗМЕНЕНО]: .NET сначала пишет UTF-8 без BOM во временный файл рядом,
+    -- .NET сначала пишет UTF-8 без BOM во временный файл рядом,
     -- затем File.Replace публикует его атомарно. Rust не увидит половину JSON.
     local safeId = substituteString (jobId as string) ":" "_"
     safeId = substituteString safeId "\\" "_"
@@ -164,7 +165,7 @@ fn VF_WriteResult task status code message warnings:#() detailsJson:"{}" = (
 fn VF_InitJson = (
     if VertexFlow_JSONSerializer != undefined then true
     else (
-        -- [ДОБАВЛЕНО]: JavaScriptSerializer — штатный .NET API, доступный через
+        -- JavaScriptSerializer — штатный .NET API, доступный через
         -- документированный dotNet interop MAXScript. Если API недоступен,
         -- задание отклоняется, а не разбирается самодельным парсером.
         try(dotNet.loadAssembly "System.Web.Extensions")catch()
@@ -182,27 +183,35 @@ fn VF_DictGet dictionary key defaultValue = (
     if VF_DictHas dictionary key then try(dictionary.Item[key])catch(defaultValue) else defaultValue
 )
 
-fn VF_TaskFileBelongsToJob jobId = (
-    -- Проверка владельца выполняется через тот же штатный
-    -- JavaScriptSerializer, что и основной разбор задания. Здесь намеренно нет
-    -- fallback-парсера: отсутствующий, повреждённый или заменённый файл безопасно
-    -- считается отменённым заданием и никогда не перезаписывается мостом.
+fn VF_TryReadTaskJobId = (
     local fileClass = dotNetClass "System.IO.File"
-    if not (fileClass.Exists VF_TASK_FILE) then false
-    else if not (VF_InitJson()) then false
+    if not (fileClass.Exists VF_TASK_FILE) then undefined
+    else if not (VF_InitJson()) then undefined
     else (
         local utf8 = dotNetObject "System.Text.UTF8Encoding" false
         local raw = try(fileClass.ReadAllText VF_TASK_FILE utf8)catch(undefined)
-        if raw == undefined then false
+        if raw == undefined then undefined
         else (
             local root = try(VertexFlow_JSONSerializer.DeserializeObject raw)catch(undefined)
-            if root == undefined then false
+            if root == undefined then undefined
             else (
                 local owner = VF_DictGet root "job_id" undefined
-                if owner == undefined then false else ((owner as string) == (jobId as string))
+                if owner == undefined then undefined
+                else (
+                    local ownerText = try(owner as string)catch(undefined)
+                    if ownerText == undefined or ownerText == "" then undefined else ownerText
+                )
             )
         )
     )
+)
+
+fn VF_TaskFileBelongsToJob jobId = (
+    -- Дублировавшиеся чтение файла и разбор JSON перенесены в
+    -- VF_TryReadTaskJobId. Сравнение владельца осталось точным и не принимает
+    -- пустой, повреждённый или чужой идентификатор.
+    local owner = VF_TryReadTaskJobId()
+    if owner == undefined then false else (owner == (jobId as string))
 )
 
 fn VF_RequireTaskOwnership task = (
@@ -225,7 +234,7 @@ fn VF_AsString value fieldName allowEmpty:false = (
 )
 
 fn VF_AsBool value fieldName = (
-    -- [ИЗМЕНЕНО]: Единственный текущий Rust-контракт передаёт настоящий JSON
+    -- Единственный текущий Rust-контракт передаёт настоящий JSON
     -- boolean. Поддержка строк "true"/"false" удалена как legacy-ветка.
     if value == true then true
     else if value == false then false
@@ -236,7 +245,7 @@ fn VF_NormalizePath pathValue = (
     local pathClass = dotNetClass "System.IO.Path"
     local value = pathValue as string
     try (
-        -- [ИЗМЕНЕНО]: Относительная подстановка через modelDir использовалась
+        -- Относительная подстановка через modelDir использовалась
         -- только mappings-алгоритмом и удалена вместе с ним.
         toLower (pathClass.GetFullPath value)
     ) catch (
@@ -259,7 +268,7 @@ fn VF_ParseTask rawJson = (
 
     local task = VFTask()
     task.status = VF_AsString (VF_DictGet root "status" undefined) "status"
-    -- [ИЗМЕНЕНО]: job_id обязателен для задания и любого ответа; версия
+    -- job_id обязателен для задания и любого ответа; версия
     -- протокола больше не нужна, потому что до релиза существует один контракт.
     task.jobId = VF_AsString (VF_DictGet root "job_id" undefined) "job_id"
     -- Terminal/processing responses intentionally contain no input paths. They
@@ -270,7 +279,7 @@ fn VF_ParseTask rawJson = (
     task.texturesPath = VF_AsString (VF_DictGet root "textures_path" "") "textures_path" allowEmpty:true
     task.relinkTextures = VF_AsBool (VF_DictGet root "relink_textures" undefined) "relink_textures"
 
-    -- [ИЗМЕНЕНО]: created_at_ms также обязателен; необязательная legacy-ветка
+    -- created_at_ms также обязателен; необязательная legacy-ветка
     -- удалена, чтобы зависшее задание нельзя было принять без возраста.
     local created = VF_DictGet root "created_at_ms" undefined
     local nowMs = try((dotNetClass "System.DateTimeOffset").UtcNow.ToUnixTimeMilliseconds())catch(undefined)
@@ -330,7 +339,7 @@ fn VF_LooksLikeExternalAsset value = (
 )
 
 fn VF_GetFilePropertyNames mapValue = (
-    -- [ДОБАВЛЕНО]: Помимо известных Standard/V-Ray/Corona/Arnold имён,
+    -- Помимо известных Standard/V-Ray/Corona/Arnold имён,
     -- проверяются строковые свойства стороннего TextureMap, реально похожие на
     -- файловую зависимость. Неизвестный класс не требует загрузки его плагина.
     local result = for propertyName in VF_FILE_PROPERTIES where isProperty mapValue propertyName collect propertyName
@@ -386,7 +395,7 @@ fn VF_CaptureLayers = (
 )
 
 fn VF_CaptureScene = (
-    -- [ДОБАВЛЕНО]: До Merge/import сохраняются handles и ссылки на объекты.
+    -- До Merge/import сохраняются handles и ссылки на объекты.
     -- Выделение и имена не используются для определения новых узлов.
     local snapshot = VFSceneSnapshot()
     snapshot.nodes = objects as array
@@ -488,7 +497,7 @@ fn VF_LocalizeImportedNodes importedNodes snapshot = (
 )
 
 fn VF_ResolveTexture oldPath task warnings = (
-    -- [ИЗМЕНЕНО]: Это основной и единственный алгоритм Vertex Flow: Rust уже
+    -- Это основной и единственный алгоритм Vertex Flow: Rust уже
     -- скопировал текстуры в одну выбранную папку с уникальными именами. Поэтому
     -- мост берёт имя из старого пути и подставляет textures_path без mappings.
     local basename = filenameFromPath oldPath
@@ -506,7 +515,7 @@ fn VF_ResolveTexture oldPath task warnings = (
 )
 
 fn VF_HasSequenceToken value = (
-    -- [ИЗМЕНЕНО]: Проверка регистронезависима и отдельно учитывает IFL —
+    -- Проверка регистронезависима и отдельно учитывает IFL —
     -- официальный контейнер 3ds Max для последовательности кадров. Без полного
     -- шаблона/содержимого многокомпонентный источник не переназначается одним
     -- basename, чтобы не получить тихо повреждённую последовательность или UDIM.
@@ -593,7 +602,7 @@ fn VF_RestoreUserState snapshot strict:false warnings:undefined = (
 )
 
 fn VF_RefreshAssetTracking strict:false warnings:undefined = (
-    -- [ИЗМЕНЕНО]: freeSceneBitmaps и глобальные изменения ассетов удалены.
+    -- freeSceneBitmaps и глобальные изменения ассетов удалены.
     -- ATSOps.Refresh только обновляет штатное представление Asset Tracking.
     local refreshed = try(ATSOps.Refresh(); true)catch(false)
     if not refreshed do (
@@ -605,7 +614,7 @@ fn VF_RefreshAssetTracking strict:false warnings:undefined = (
 )
 
 fn VF_RestoreExistingScene snapshot warnings = (
-    -- [ДОБАВЛЕНО]: Rollback восстанавливает зафиксированные значения старых
+    -- Rollback восстанавливает зафиксированные значения старых
     -- узлов/карт/Environment, если штатный importer успел изменить их до сбоя.
     for state in snapshot.nodeStates do (
         local nodeValue = state[1]
@@ -649,7 +658,7 @@ fn VF_ImportModel task = (
     local extension = toLower (getFilenameType task.modelPath)
     local result = false
     if extension == ".max" then (
-        -- [ИЗМЕНЕНО]: Merge не заменяет узлы и материалы с совпавшими именами,
+        -- Merge не заменяет узлы и материалы с совпавшими именами,
         -- а принадлежность новых узлов не определяется по выделению.
         result = mergeMAXFile task.modelPath #select #autoRenameDups #renameMtlDups #neverReparent quiet:true
     ) else if extension == ".fbx" or extension == ".obj" then (
@@ -723,14 +732,14 @@ fn VertexFlow_ProcessTask sender eventArgs = (
                 if result[1] then (
                     local finalMessage = if result[3].count > 0 then "Import completed with warnings" else "Import completed"
                     if (VF_WriteResult task result[2] undefined finalMessage warnings:result[3] detailsJson:result[4]) then (
-                        -- [ИЗМЕНЕНО]: Задание считается обработанным только после
+                        -- Задание считается обработанным только после
                         -- успешной публикации terminal-ответа. Это исключает ложный
                         -- локальный success, который приложение никогда не увидело.
                         append VertexFlow_ProcessedJobs task.jobId
                         if VertexFlow_ProcessedJobs.count > 128 do deleteItem VertexFlow_ProcessedJobs 1
                         VertexFlow_LogMsg finalMessage level:(if result[3].count > 0 then "WARNING" else "INFO")
                     ) else (
-                        -- [ДОБАВЛЕНО]: Если Vertex Flow закрылся после завершения
+                        -- Если Vertex Flow закрылся после завершения
                         -- импортёра, но до публикации результата, успешная локальная
                         -- транзакция откатывается. Мост не оставляет в коммерческой
                         -- сцене импорт, который приложение считает отменённым.
@@ -742,7 +751,7 @@ fn VertexFlow_ProcessTask sender eventArgs = (
                         )
                     )
                 ) else (
-                    -- [ИЗМЕНЕНО]: Ошибка транзакции уже сопровождается rollback.
+                    -- Ошибка транзакции уже сопровождается rollback.
                     -- Если приложение ещё работает, оно получает точный ответ;
                     -- если task-файл удалён при закрытии, мост только фиксирует
                     -- отмену в Listener и не воссоздаёт JSON.
@@ -757,7 +766,13 @@ fn VertexFlow_ProcessTask sender eventArgs = (
     ) catch (
         local message = getCurrentException()
         VertexFlow_LogMsg (VertexFlow_LastErrorCode + ": " + message) level:"ERROR"
-        -- [ИЗМЕНЕНО]: Если JSON сломан ещё до чтения обязательного job_id,
+
+        if task.jobId == "" do (
+            local recoveredJobId = VF_TryReadTaskJobId()
+            if recoveredJobId != undefined do task.jobId = recoveredJobId
+        )
+
+        -- Если JSON сломан ещё до чтения обязательного job_id,
         -- мост не публикует ответ без владельца. Rust сам отклонит исходный файл.
         if task.jobId != "" do try(VF_WriteResult task "error" VertexFlow_LastErrorCode message)catch()
     )
@@ -807,7 +822,7 @@ fn VertexFlow_OpenUI = (
     createDialog VertexFlowListenerUI style:#(#style_toolwindow, #style_sysmenu)
 )
 
--- [ИЗМЕНЕНО]: Повторный запуск .ms останавливает прежний Timer и его handlers;
+-- Повторный запуск .ms останавливает прежний Timer и его handlers;
 -- callbacks не накапливаются после startup, fileIn или обновления скрипта.
 if VertexFlow_Timer != undefined do (
     try(VertexFlow_Timer.Stop())catch()
@@ -819,7 +834,7 @@ if VertexFlow_Timer != undefined do (
 if (maxVersion())[1] < VF_MIN_MAX_MAJOR then (
     VertexFlow_LogMsg "ERR_MAX_VERSION_UNSUPPORTED: 3ds Max 2022 or newer is required" level:"ERROR"
 ) else if not (VF_InitJson()) then (
-    -- [ДОБАВЛЕНО]: JSON backend проверяется до запуска Timer. Раньше listener
+    -- JSON backend проверяется до запуска Timer. Раньше listener
     -- сообщал "started", даже если среда .NET не могла загрузить официальный
     -- System.Web serializer; первое задание затем оставалось без ответа.
     -- Явная ошибка не маскирует несовместимость среды под ожидание задания.
