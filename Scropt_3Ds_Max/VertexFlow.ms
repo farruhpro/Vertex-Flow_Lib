@@ -1,4 +1,5 @@
 /*
+
     Vertex Flow transactional bridge for 3ds Max.
     Developer source format: .ms. Public release format: encrypted .mse created
     from this self-contained source with the standard MAXScript encryptScript().
@@ -38,6 +39,17 @@ global VF_FILE_PROPERTIES = #(
     #sourceFile, #sourceFilename, #textureFile, #bitmapFile,
     #ies_file, #iesFile
 )
+
+-- Явные предварительные объявления трёх глобальных функций,
+-- на которые код ссылается до их определения ниже в файле.
+--
+-- global — штатное объявление области видимости MAXScript. Оно не меняет
+-- протокол, транзакцию или алгоритм импорта: после загрузки соответствующие fn
+-- ниже присваивают этим именам реальные функции, а Timer запускается только в
+-- самом конце файла, когда все определения уже завершены.
+global VF_TaskFileBelongsToJob
+global VF_CollectMaterialGraph
+global VF_LocalizeMaterial
 
 struct VFTask (
     jobId = "",
