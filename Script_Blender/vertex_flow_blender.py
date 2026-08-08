@@ -5,17 +5,12 @@
 Переназначение путей выполняется только при ``relink_textures == True`` — это
 общая настройка Vertex Flow для всех поддерживаемых DCC.
 
-[ИЗМЕНЕНО]: Глобальный relink по разнице всех bpy.data.images удалён: сначала
-выделяются только изображения текущего импорта и изолируются shared data-blocks,
-после чего путь строится по уникальному имени в textures_path. [УДАЛЕНО]: broad
-except/pass и неатомарная запись ответа создавали ложный complete и повторное
-выполнение задания.
 """
 
 bl_info = {
     "name": "Vertex Flow Integration",
     "author": "Farrukh Gulamzhanov",
-    # [ИЗМЕНЕНО]: Искусственный major 2, появившийся вместе с protocol v2,
+    # Искусственный major 2, появившийся вместе с protocol v2,
     # удалён. До первого релиза сохраняется исходная ветка интеграции 1.1.
     "version": (1, 1, 0),
     "blender": (3, 6, 0),
@@ -109,7 +104,7 @@ class VF_Logs:
 
     @classmethod
     def add(cls, message, level="INFO"):
-        # [ИЗМЕНЕНО]: UI и системная консоль получают одну диагностическую запись;
+        # UI и системная консоль получают одну диагностическую запись;
         # ошибки больше не исчезают внутри широких ``except: pass``.
         text = "[{0}] {1}".format(level, str(message))
         print("[Vertex Flow] " + text)
@@ -149,10 +144,10 @@ class VF_OT_clear_logs(bpy.types.Operator):
 
 
 def _atomic_write_json(path, payload, job_id):
-    # [ИЗМЕНЕНО]: Ответ сначала пишется во временный файл рядом, сбрасывается
+    # Ответ сначала пишется во временный файл рядом, сбрасывается
     # через fsync и атомарно заменяет основной. Rust не прочитает половину JSON.
     safe_job_id = "".join(ch for ch in str(job_id) if ch.isalnum() or ch in "-_")[:96]
-    # [ИЗМЕНЕНО]: job_id всегда обязателен и генерируется Rust, поэтому имя
+    # job_id всегда обязателен и генерируется Rust, поэтому имя
     # временного файла больше не содержит legacy-заглушку.
     temporary = path.with_name(".{0}.{1}.tmp".format(path.name, safe_job_id))
     try:
@@ -171,7 +166,7 @@ def _atomic_write_json(path, payload, job_id):
 
 def _write_result(task, status, code, message, warnings=None, details=None):
     payload = {
-        # [ИЗМЕНЕНО]: В единственном текущем контракте ответ связывается с
+        # В единственном текущем контракте ответ связывается с
         # заданием только обязательным job_id; protocol_version удалён.
         "job_id": task["job_id"],
         "status": status,
@@ -227,7 +222,7 @@ def _validate_task(task):
     if status != "pending":
         return None
 
-    # [ИЗМЕНЕНО]: Искусственное версионирование и задание без job_id удалены.
+    # Искусственное версионирование и задание без job_id удалены.
     # До релиза мост принимает ровно один текущий контракт.
     job_id = task.get("job_id")
     if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
@@ -235,7 +230,7 @@ def _validate_task(task):
     if job_id in _VF_PROCESSED_JOB_IDS:
         return None
 
-    # [ИЗМЕНЕНО]: Время создания обязательно для каждого pending-задания;
+    # Время создания обязательно для каждого pending-задания;
     # ветка без timestamp больше не может обойти проверку зависшего файла.
     created_at_ms = task.get("created_at_ms")
     if not isinstance(created_at_ms, int):
@@ -250,7 +245,7 @@ def _validate_task(task):
     if not isinstance(textures_path_raw, str):
         raise BridgeError("ERR_TASK_SCHEMA", "textures_path must be a string")
     textures_path = Path(textures_path_raw) if textures_path_raw else None
-    # [ИЗМЕНЕНО]: Несмотря на историческое имя настройки в UI, это общий
+    # Несмотря на историческое имя настройки в UI, это общий
     # переключатель для 3ds Max и Blender. Мост принимает только JSON boolean.
     relink_textures = task.get("relink_textures")
     if not isinstance(relink_textures, bool):
@@ -267,7 +262,7 @@ def _validate_task(task):
         raise BridgeError("ERR_SCENE_NOT_SAVED", "The current Blender project must be saved first")
     if not _same_file(bpy.data.filepath, project_path):
         raise BridgeError("ERR_PROJECT_MISMATCH", "The open Blender project does not match the task")
-    # [ИЗМЕНЕНО]: Папка текстур нужна только для фактического переназначения.
+    # Папка текстур нужна только для фактического переназначения.
     # При выключенном тумблере модель импортируется без изменения путей, поэтому
     # пустой textures_path не должен блокировать безопасный импорт.
     if relink_textures:
@@ -290,7 +285,7 @@ class SceneSnapshot:
     """Снимок старой сцены для определения новых ресурсов и проверки защиты."""
 
     def __init__(self, context):
-        # [ДОБАВЛЕНО]: Ресурсы текущего импорта определяются по разнице наборов ID,
+        # Ресурсы текущего импорта определяются по разнице наборов ID,
         # а не по выделению, active collection, именам или побочным эффектам importer.
         self.ids = {}
         for name in ID_COLLECTION_NAMES:
@@ -378,7 +373,7 @@ class SceneSnapshot:
             raise BridgeError("ERR_SCENE_PROTECTION_VIOLATION", "World or Compositor was changed")
 
     def restore_existing_scene(self, context, warnings):
-        # [ДОБАВЛЕНО]: Если штатный importer частично изменил старую сцену,
+        # Если штатный importer частично изменил старую сцену,
         # rollback восстанавливает снимок до проверки удаления новых ID.
         current_objects = set(bpy.data.objects)
         for image, old_path in self.image_paths.items():
@@ -440,7 +435,7 @@ class SceneSnapshot:
 
 
 def _restore_user_state(snapshot, context, warnings=None, strict=False):
-    # [ДОБАВЛЕНО]: Операторы импорта могут менять mode, selection и active collection.
+    # Операторы импорта могут менять mode, selection и active collection.
     # После success или rollback временное состояние пользователя восстанавливается.
     failures = []
     try:
@@ -497,7 +492,7 @@ def _find_layer_collection(layer_collection, target):
 
 
 def _make_import_collection(context, job_id):
-    # [ИЗМЕНЕНО]: job_id обязателен, поэтому временное имя по текущему времени
+    # job_id обязателен, поэтому временное имя по текущему времени
     # больше не подменяет отсутствующий идентификатор задания.
     name = "VertexFlow_" + job_id[:48]
     collection = bpy.data.collections.new(name)
@@ -510,7 +505,7 @@ def _make_import_collection(context, job_id):
 
 
 def _isolate_imported_collections(context, snapshot, target_collection, imported_objects):
-    # [ДОБАВЛЕНО]: Даже если importer проигнорировал active collection, новые
+    # Даже если importer проигнорировал active collection, новые
     # объекты/коллекции удаляются из старых ветвей и помещаются под job-collection.
     old_collections = set(snapshot.ids.get("collections", set()))
     old_collections.add(context.scene.collection)
@@ -532,7 +527,7 @@ def _isolate_imported_collections(context, snapshot, target_collection, imported
 
 
 def _import_blend(model_path, target_collection):
-    # [ИЗМЕНЕНО]: .blend всегда использует локальный Append (link=False), поэтому
+    # .blend всегда использует локальный Append (link=False), поэтому
     # импортированный ассет не сохраняет зависимость от исходного .blend.
     with bpy.data.libraries.load(str(model_path), link=False) as (data_from, data_to):
         data_to.objects = list(data_from.objects)
@@ -554,7 +549,7 @@ def _import_fbx(model_path):
 
 
 def _import_obj(model_path):
-    # [ДОБАВЛЕНО]: Эта развилка относится к поддерживаемым Blender 3.6 и 4.x/5.x,
+    # Эта развилка относится к поддерживаемым Blender 3.6 и 4.x/5.x,
     # а не к старым версиям протокола Vertex Flow.
     modern = getattr(getattr(bpy.ops, "wm", None), "obj_import", None)
     blender_36_operator = getattr(getattr(bpy.ops, "import_scene", None), "obj", None)
@@ -671,7 +666,7 @@ class TextureResolver:
     """Находит скопированную текстуру по уникальному имени в textures_path."""
 
     def __init__(self, task, warnings):
-        # [ИЗМЕНЕНО]: Rust уже скопировал все текстуры в одну плоскую папку с
+        # Rust уже скопировал все текстуры в одну плоскую папку с
         # гарантированно уникальными именами. Индексы source->target и обход
         # всей папки больше не создаются.
         self.warnings = warnings
@@ -681,7 +676,7 @@ class TextureResolver:
         raw_path = image.filepath or ""
         if not raw_path:
             return None
-        # [ИЗМЕНЕНО]: Нормализуем оба разделителя только для извлечения имени,
+        # Нормализуем оба разделителя только для извлечения имени,
         # чтобы Windows-путь из модели корректно работал и в Blender на macOS.
         filename = raw_path.replace("\\", "/").rsplit("/", 1)[-1]
         target = self.root / filename
@@ -714,7 +709,7 @@ def _relink_images(task, images, warnings, journal):
             warnings.append("WARN_PACKED_IMAGE_SKIPPED: " + image.name)
             continue
         if source_type in {"SEQUENCE", "TILED"}:
-            # [ИЗМЕНЕНО]: SEQUENCE и UDIM состоят из нескольких файлов. Подмена
+            # SEQUENCE и UDIM состоят из нескольких файлов. Подмена
             # их одним basename может незаметно оставить только один кадр/тайл.
             # Без подтверждённого полного шаблона сохраняем исходный путь и
             # явно возвращаем warning — это fail-safe поведение обоих мостов.
@@ -873,7 +868,7 @@ def vertex_flow_listener():
         if task is None:
             return 1.0
         _VF_BUSY = True
-        # [ИЗМЕНЕНО]: processing записывается тем же строгим форматом ответа,
+        # processing записывается тем же строгим форматом ответа,
         # поэтому Rust не принимает копию входного задания за повреждённый ответ.
         _write_result(task, "processing", None, "Blender is processing the task")
         VF_Logs.add("Import started: " + Path(task["model_path"]).name)
@@ -917,7 +912,7 @@ def vf_start_timer_handler(_dummy):
 
 
 def register():
-    # [ИЗМЕНЕНО]: Ранее загруженные listener и handler удаляются явно;
+    # Ранее загруженные listener и handler удаляются явно;
     # повторный запуск .py не накапливает timers и load_post callbacks.
     if _VF_PREVIOUS_LISTENER is not None:
         try:
@@ -954,7 +949,7 @@ def unregister():
             pass
 
 
-# [ИЗМЕНЕНО]: Blender выполняет startup-скрипт, но не вызывает addon register()
+# Blender выполняет startup-скрипт, но не вызывает addon register()
 # автоматически. Регистрация вызывается здесь и не создаёт фоновых threads.
 try:
     register()
