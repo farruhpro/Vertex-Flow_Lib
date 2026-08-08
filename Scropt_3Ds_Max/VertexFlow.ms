@@ -12,7 +12,6 @@
     обход и сброс могли менять/выгружать ресурсы существующей сцены.
     [УДАЛЕНО]: python.Execute с бинарным чтением .max для угадывания версии — это
     недокументированный хак; штатный importer теперь возвращает честную ошибку.
-
 */
 
 global VertexFlow_Timer
@@ -257,6 +256,20 @@ fn VF_IsAbsolute pathValue = (
     try((dotNetClass "System.IO.Path").IsPathRooted (pathValue as string))catch(false)
 )
 
+-- [УДАЛЕНО]: Вызов несуществующей функции doesDirectoryExist удалён.
+-- MAXScript не объявляет такую встроенную функцию, поэтому при включённом
+-- relink_textures проверка абсолютного textures_path доходила до undefined и
+-- завершалась ошибкой "Call needs function or class, got: undefined" до импорта.
+--
+-- [ДОБАВЛЕНО]: Проверка каталога выполняется штатным System.IO.Directory.Exists
+-- через документированный Autodesk dotNetClass. Метод ничего не создаёт и не
+-- изменяет на диске: он только возвращает true для существующего каталога.
+fn VF_DirectoryExists pathValue = (
+    local directoryClass = try(dotNetClass "System.IO.Directory")catch(undefined)
+    if directoryClass == undefined then false
+    else try(directoryClass.Exists (pathValue as string))catch(false)
+)
+
 fn VF_CurrentProjectPath = (
     if maxFileName == "" then "" else (maxFilePath + maxFileName)
 )
@@ -316,7 +329,11 @@ fn VF_ValidateTask task = (
             local extension = toLower (getFilenameType task.modelPath)
             if (findItem #(".max", ".fbx", ".obj") extension) == 0 do VF_Fail "ERR_UNSUPPORTED_FORMAT" ("Unsupported format: " + extension)
             if task.relinkTextures do (
-                if task.texturesPath == "" or not (VF_IsAbsolute task.texturesPath) or not (doesDirectoryExist task.texturesPath) do VF_Fail "ERR_TEXTURES_DIR" "textures_path must be an existing absolute directory"
+                -- Невалидный doesDirectoryExist заменён на
+                -- VF_DirectoryExists, использующий System.IO.Directory.Exists.
+                -- Порядок и смысл проверки не изменены: каталог обязателен
+                -- только когда пользователь включил переназначение текстур.
+                if task.texturesPath == "" or not (VF_IsAbsolute task.texturesPath) or not (VF_DirectoryExists task.texturesPath) do VF_Fail "ERR_TEXTURES_DIR" "textures_path must be an existing absolute directory"
             )
             true
         )
@@ -638,10 +655,21 @@ fn VF_Rollback snapshot journal = (
         try(setProperty entry[1] entry[2] entry[3])catch(append warnings "ROLLBACK_TEXTURE_PROPERTY_FAILED")
     )
     VF_RestoreExistingScene snapshot warnings
-    local newNodes = VF_GetNewNodes snapshot
+    -- Получение новых узлов во время rollback теперь защищено.
+    -- Раньше редкое исключение getHandleByAnim/обхода сцены прерывало весь
+    -- rollback и не позволяло выполнить последующие восстановительные шаги.
+    local newNodes = try(VF_GetNewNodes snapshot)catch(
+        append warnings ("ROLLBACK_NEW_NODE_SCAN_FAILED: " + getCurrentException())
+        #()
+    )
     for nodeValue in newNodes do try(delete nodeValue)catch(append warnings ("ROLLBACK_NODE_DELETE_FAILED: " + nodeValue.name))
     -- Remove only layers created by this operation, and only when no node remains.
-    local currentLayers = VF_CaptureLayers()
+    -- Ошибка чтения LayerManager больше не обрывает восстановление
+    -- выделения, режима пользователя и Asset Tracking.
+    local currentLayers = try(VF_CaptureLayers())catch(
+        append warnings ("ROLLBACK_LAYER_SCAN_FAILED: " + getCurrentException())
+        #()
+    )
     for layerValue in currentLayers where (findItem snapshot.layers layerValue) == 0 do (
         local layerNodes = #()
         try(layerValue.nodes &layerNodes)catch()
@@ -650,7 +678,14 @@ fn VF_Rollback snapshot journal = (
     VF_RestoreUserState snapshot warnings:warnings
     VF_RefreshAssetTracking warnings:warnings
     try(VF_VerifyExistingScene snapshot)catch(append warnings ("ROLLBACK_SCENE_VERIFY_FAILED: " + getCurrentException()))
-    if (VF_GetNewNodes snapshot).count > 0 do append warnings "ROLLBACK_NEW_NODES_REMAIN"
+    -- Финальная проверка rollback тоже не может выбросить исключение
+    -- наружу и скрыть исходную причину импорта; сбой самой проверки возвращается
+    -- как точное предупреждение ERR_ROLLBACK_FAILED.
+    local remainingNodeCount = try((VF_GetNewNodes snapshot).count)catch(
+        append warnings ("ROLLBACK_FINAL_SCAN_FAILED: " + getCurrentException())
+        -1
+    )
+    if remainingNodeCount > 0 do append warnings "ROLLBACK_NEW_NODES_REMAIN"
     warnings
 )
 
@@ -668,6 +703,10 @@ fn VF_ImportModel task = (
 )
 
 fn VF_ExecuteTransaction task = (
+    -- Локальная фаза транзакции дополняет внешнюю диагностику.
+    -- Она не влияет на rollback и нужна только для точного определения места
+    -- ошибки после того, как processing уже опубликован приложению.
+    local phase = "capture_scene"
     local snapshot = VF_CaptureScene()
     local journal = #()
     local warnings = #()
@@ -675,24 +714,35 @@ fn VF_ExecuteTransaction task = (
     try (
         -- До первого изменения сцены убеждаемся, что приложение
         -- не закрылось и всё ещё ожидает результат именно этого задания.
+        phase = "ownership_before_import"
         VF_RequireTaskOwnership task
+        phase = "import_model"
         if not (VF_ImportModel task) do VF_Fail "ERR_IMPORT_FAILED" "3ds Max importer returned false"
         -- mergeMAXFile/importFile выполняются синхронно. Если
         -- Vertex Flow закрылся во время штатного импортёра, удаление task-файла
         -- обнаруживается сразу после его возврата и запускает rollback.
+        phase = "ownership_after_import"
         VF_RequireTaskOwnership task
+        phase = "collect_imported_nodes"
         importedNodes = VF_GetNewNodes snapshot
         if importedNodes.count == 0 do VF_Fail "ERR_NO_IMPORTED_OBJECTS" "Importer created no new nodes"
+        phase = "isolate_shared_resources"
         VF_LocalizeImportedNodes importedNodes snapshot
         -- Вторая контрольная точка не позволяет продолжить
         -- переназначение путей после отмены задания приложением.
+        phase = "ownership_before_relink"
         VF_RequireTaskOwnership task
+        phase = "relink_textures"
         local relinked = VF_RelinkImported task importedNodes snapshot warnings journal
         -- Финальная контрольная точка выполняется до подтверждения
         -- транзакции. Отмена во время обхода материалов также приводит к rollback.
+        phase = "ownership_before_commit"
         VF_RequireTaskOwnership task
+        phase = "verify_existing_scene"
         VF_VerifyExistingScene snapshot
+        phase = "restore_user_state"
         VF_RestoreUserState snapshot strict:true
+        phase = "refresh_asset_tracking"
         VF_RefreshAssetTracking strict:true
         local status = if warnings.count > 0 then "completed_with_warnings" else "completed"
         local details = "{\"imported_nodes\":" + (importedNodes.count as string) + ",\"relinked_paths\":" + (relinked as string) + "}"
@@ -700,13 +750,17 @@ fn VF_ExecuteTransaction task = (
     ) catch (
         local originalCode = VertexFlow_LastErrorCode
         local originalMessage = getCurrentException()
+        local originalPhase = phase
+        -- Теперь Console сразу показывает точную фазу и причину.
+        VertexFlow_LogMsg (originalCode + " [phase=" + phase + "]: " + originalMessage) level:"ERROR"
+        phase = "rollback"
         local rollbackWarnings = VF_Rollback snapshot journal
         if rollbackWarnings.count > 0 then (
             VertexFlow_LastErrorCode = "ERR_ROLLBACK_FAILED"
-            #(false, "error", rollbackWarnings, "{\"rollback\":\"incomplete\",\"original_code\":\"" + VF_JsonEscape originalCode + "\"}", snapshot, journal)
+            #(false, "error", rollbackWarnings, "{\"rollback\":\"incomplete\",\"original_code\":\"" + VF_JsonEscape originalCode + "\",\"original_phase\":\"" + VF_JsonEscape originalPhase + "\"}", snapshot, journal)
         ) else (
             VertexFlow_LastErrorCode = originalCode
-            #(false, "rolled_back", #(), "{\"rollback\":\"completed\",\"original_message\":\"" + VF_JsonEscape originalMessage + "\"}", snapshot, journal)
+            #(false, "rolled_back", #(), "{\"rollback\":\"completed\",\"original_phase\":\"" + VF_JsonEscape originalPhase + "\",\"original_message\":\"" + VF_JsonEscape originalMessage + "\"}", snapshot, journal)
         )
     )
 )
@@ -716,21 +770,40 @@ fn VertexFlow_ProcessTask sender eventArgs = (
     if not (doesFileExist VF_TASK_FILE) do return false
     local task = VFTask()
     local shouldRestart = VertexFlow_Listening
+    -- phase отмечает последний начатый этап, чтобы внутреннее
+    -- исключение больше не теряло место возникновения во внешнем catch.
+    -- Это только диагностика; порядок операций и JSON-протокол не меняются.
+    local phase = "initialize"
     if VertexFlow_Timer != undefined do VertexFlow_Timer.Stop()
     VertexFlow_Busy = true
     VertexFlow_LastErrorCode = "ERR_MAX_INTERNAL"
     try (
+        phase = "read_task"
         task = VF_ReadTask()
+        phase = "validate_task"
         if task == undefined or not (VF_ValidateTask task) then ok
         else (
             -- Теперь импорт начинается только после успешной публикации processing.
+            phase = "publish_processing"
             if not (VF_WriteResult task "processing" undefined "3ds Max is processing the task") then (
                 VertexFlow_LogMsg "TASK_CANCELLED: import was not started" level:"WARNING"
+                --  Если приложение удалило/заменило task-файл,
+                -- это штатная отмена и listener продолжает ждать новые задания.
+                -- Если же pending-файл всё ещё наш, публикация processing реально
+                -- сломана; повторять её каждую секунду означало бы флудить лог.
+                local pendingStillOwned = try(VF_TaskFileBelongsToJob task.jobId)catch(false)
+                if pendingStillOwned do (
+                    shouldRestart = false
+                    VertexFlow_Listening = false
+                    VertexFlow_LogMsg "Listening stopped: processing response could not be published" level:"WARNING"
+                )
             ) else (
                 VertexFlow_LogMsg ("Import started: " + filenameFromPath task.modelPath)
+                phase = "execute_transaction"
                 local result = VF_ExecuteTransaction task
                 if result[1] then (
                     local finalMessage = if result[3].count > 0 then "Import completed with warnings" else "Import completed"
+                    phase = "publish_success"
                     if (VF_WriteResult task result[2] undefined finalMessage warnings:result[3] detailsJson:result[4]) then (
                         -- Задание считается обработанным только после
                         -- успешной публикации terminal-ответа. Это исключает ложный
@@ -755,6 +828,7 @@ fn VertexFlow_ProcessTask sender eventArgs = (
                     -- Если приложение ещё работает, оно получает точный ответ;
                     -- если task-файл удалён при закрытии, мост только фиксирует
                     -- отмену в Listener и не воссоздаёт JSON.
+                    phase = "publish_transaction_error"
                     if (VF_WriteResult task result[2] VertexFlow_LastErrorCode "Import failed" warnings:result[3] detailsJson:result[4]) then (
                         VertexFlow_LogMsg (VertexFlow_LastErrorCode + ": Import failed") level:"ERROR"
                     ) else (
@@ -765,16 +839,66 @@ fn VertexFlow_ProcessTask sender eventArgs = (
         )
     ) catch (
         local message = getCurrentException()
-        VertexFlow_LogMsg (VertexFlow_LastErrorCode + ": " + message) level:"ERROR"
+        -- Фиксируем лог и фазу.
+        VertexFlow_LogMsg (VertexFlow_LastErrorCode + " [phase=" + phase + "]: " + message) level:"ERROR"
+
+        -- Начиная с 3ds Max 2017 MAXScript умеет отдавать стек
+        -- текущего исключения внутри catch. Мост поддерживает 2022+, поэтому
+        -- диагностический стек доступен; безопасный try оставляет совместимый
+        -- fallback, если конкретная сборка не сформировала стек.
+        local stackTrace = try(
+            if hasCurrentExceptionStackTrace() then (getCurrentExceptionStackTrace() as string) else ""
+        )catch("")
+        if stackTrace != undefined and stackTrace != "" do VertexFlow_LogMsg ("MAXScript stack: " + stackTrace) level:"ERROR"
 
         if task.jobId == "" do (
-            local recoveredJobId = VF_TryReadTaskJobId()
+            -- Аварийное повторное чтение одного job_id теперь само
+            -- защищено. Раньше второе исключение внутри catch могло выйти наружу,
+            -- оставить VertexFlow_Busy=true и Timer остановленным навсегда.
+            local recoveredJobId = try(VF_TryReadTaskJobId())catch(
+                VertexFlow_LogMsg ("ERR_TASK_OWNER_RECOVERY [phase=" + phase + "]: " + getCurrentException()) level:"ERROR"
+                undefined
+            )
             if recoveredJobId != undefined do task.jobId = recoveredJobId
         )
 
         -- Если JSON сломан ещё до чтения обязательного job_id,
         -- мост не публикует ответ без владельца. Rust сам отклонит исходный файл.
-        if task.jobId != "" do try(VF_WriteResult task "error" VertexFlow_LastErrorCode message)catch()
+        if task.jobId == "" then (
+            -- Атомарно созданный, но не позволяющий подтвердить
+            -- job_id файл нельзя безопасно заменить ответом. Чтобы такой файл не
+            -- вызывал одно и то же исключение каждую секунду, listener переходит
+            -- в явный fail-safe stop; сцена и сам 3ds Max не затрагиваются.
+            if doesFileExist VF_TASK_FILE do (
+                shouldRestart = false
+                VertexFlow_Listening = false
+                VertexFlow_LogMsg "Listening stopped: task owner could not be verified" level:"WARNING"
+            )
+        ) else (
+            -- Ошибка записи ответа больше не скрывается пустым catch.
+            -- Если общий task-файл нельзя атомарно заменить, повторять весь
+            -- неисправный цикл каждую секунду небезопасно: это создаёт флуд и
+            -- может многократно запускать подготовительную логику. Listener
+            -- останавливается явно, но 3ds Max и сцена продолжают работать.
+            local errorPublished = false
+            try(
+                errorPublished = VF_WriteResult task "error" VertexFlow_LastErrorCode ("[phase=" + phase + "] " + message)
+            )catch(
+                VertexFlow_LogMsg ("ERR_RESULT_WRITE [phase=" + phase + "]: " + getCurrentException()) level:"ERROR"
+            )
+            if not errorPublished do (
+                -- Удалённое приложением задание является штатной
+                -- отменой и не отключает listener. Он останавливается только
+                -- если файл всё ещё принадлежит этому job_id, но terminal-ответ
+                -- записать не удалось — именно такой случай раньше флудил лог.
+                local taskStillOwned = try(VF_TaskFileBelongsToJob task.jobId)catch(false)
+                if taskStillOwned do (
+                    shouldRestart = false
+                    VertexFlow_Listening = false
+                    VertexFlow_LogMsg "Listening stopped: terminal response could not be published" level:"WARNING"
+                )
+            )
+        )
     )
     VertexFlow_Busy = false
     if shouldRestart and VertexFlow_Timer != undefined do VertexFlow_Timer.Start()
